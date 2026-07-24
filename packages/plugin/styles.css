@@ -1,0 +1,26 @@
+.vault-relay-status {
+  display: flex;
+  align-items: center;
+  gap: var(--size-4-2);
+}
+
+.vault-relay-status__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+
+.vault-relay-status__dot.is-syncing { background: var(--interactive-accent); }
+.vault-relay-status__dot.is-error { background: var(--text-error); }
+.vault-relay-status__dot.is-conflict { background: var(--color-orange); }
+
+.vault-relay-conflict {
+  padding: var(--size-4-3) 0;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.vault-relay-setting-note {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+}

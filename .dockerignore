@@ -1,0 +1,9 @@
+node_modules
+**/node_modules
+**/dist
+packages/plugin/main.js
+packages/plugin/main.js.map
+.git
+.env
+data
+coverage

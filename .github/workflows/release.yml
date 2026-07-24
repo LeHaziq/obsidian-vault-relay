@@ -1,0 +1,32 @@
+name: Release plugin
+
+on:
+  push:
+    tags:
+      - "*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.13.0"
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - name: Verify release version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: node -e "const fs=require('fs'); const root=require('./manifest.json'); const plugin=require('./packages/plugin/manifest.json'); if(root.version!==process.env.TAG||plugin.version!==process.env.TAG||require('./package.json').version!==process.env.TAG) throw new Error('Tag and manifest versions must match')"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            packages/plugin/main.js
+            packages/plugin/manifest.json
+            packages/plugin/styles.css
+          generate_release_notes: true

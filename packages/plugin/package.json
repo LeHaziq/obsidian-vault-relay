@@ -1,0 +1,26 @@
+{
+  "name": "vault-relay-obsidian",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "files": [
+    "main.js",
+    "manifest.json",
+    "styles.css"
+  ],
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@vault-relay/protocol": "0.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.32",
+    "esbuild": "^0.25.5",
+    "obsidian": "^1.8.7",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  }
+}

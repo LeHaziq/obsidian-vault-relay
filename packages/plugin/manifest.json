@@ -1,0 +1,9 @@
+{
+  "id": "vault-relay",
+  "name": "Vault Relay",
+  "version": "0.1.0",
+  "minAppVersion": "1.11.4",
+  "description": "Loss-resistant Google Drive sync for notes and attachments.",
+  "author": "Vault Relay contributors",
+  "isDesktopOnly": false
+}
