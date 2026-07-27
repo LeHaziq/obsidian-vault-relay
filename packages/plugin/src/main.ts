@@ -3,9 +3,19 @@ import { Notice, Plugin, setIcon } from "obsidian";
 import { GoogleAuth } from "./auth";
 import { GoogleDriveRemote, type RemoteVaultSummary } from "./google-drive";
 import { ObsidianLocalVault } from "./local-vault";
-import { DEFAULT_SETTINGS, type PluginSettings } from "./model";
+import { DEFAULT_SETTINGS, sanitizeSettings, type DriveLayout, type PluginSettings } from "./model";
+import { redactTokens } from "./redact";
 import { normalizeRelayOrigin } from "./relay-url";
 import { AuthorizationModal, ConflictModal, RestoreModal, SetupModal, VaultRelaySettingTab } from "./ui";
+
+export interface RelayUrlChange {
+  applied: boolean;
+  error?: string;
+}
+
+function isAbort(error: unknown): boolean {
+  return typeof error === "object" && error !== null && (error as { name?: string }).name === "AbortError";
+}
 
 export default class VaultRelayPlugin extends Plugin {
   settings: PluginSettings = structuredClone(DEFAULT_SETTINGS);
@@ -15,7 +25,11 @@ export default class VaultRelayPlugin extends Plugin {
   private statusDot!: HTMLElement;
   private statusText!: HTMLElement;
   private timer: number | null = null;
+  private inFlight: Promise<void> | null = null;
+  private lock: Promise<void> | null = null;
+  private aborter: AbortController | null = null;
   private syncing = false;
+  private unloading = false;
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -61,7 +75,12 @@ export default class VaultRelayPlugin extends Plugin {
   }
 
   onunload(): void {
+    this.unloading = true;
     if (this.timer !== null) window.clearInterval(this.timer);
+    this.timer = null;
+    // Without this a sync in progress keeps writing vault files and calling
+    // saveData after the plugin has been torn down.
+    this.aborter?.abort();
   }
 
   async connect(): Promise<void> {
@@ -70,24 +89,36 @@ export default class VaultRelayPlugin extends Plugin {
       const authorizationUrl = await this.auth.prepareAuthorization();
       new AuthorizationModal(this.app, authorizationUrl).open();
     } catch (error) {
-      this.reportError(error);
+      await this.reportError(error);
     }
   }
 
-  async updateRelayUrl(value: string): Promise<void> {
+  /**
+   * Applies a relay URL change. The caller commits on blur rather than on each
+   * keystroke: partial input such as "https://a" parses as a valid origin, so
+   * per-keystroke handling silently disconnected Google and unbound the remote
+   * vault while the user was still typing.
+   */
+  async updateRelayUrl(value: string, confirmDisconnect: () => Promise<boolean>): Promise<RelayUrlChange> {
     let origin: string;
     try {
       origin = normalizeRelayOrigin(value.trim());
-    } catch {
-      return;
+    } catch (error) {
+      return { applied: false, error: error instanceof Error ? error.message : String(error) };
     }
-    if (origin === this.settings.relayUrl) return;
-    if (this.settings.connected) await this.auth.disconnect();
-    this.settings.relayUrl = origin;
-    this.settings.connected = false;
-    this.settings.layout = null;
-    await this.saveSettings();
+    if (origin === this.settings.relayUrl) return { applied: true };
+    if ((this.settings.connected || this.settings.layout !== null) && !(await confirmDisconnect())) {
+      return { applied: false };
+    }
+    await this.exclusive(async () => {
+      if (this.settings.connected) await this.auth.disconnect();
+      this.settings.relayUrl = origin;
+      this.settings.connected = false;
+      this.settings.layout = null;
+      await this.saveSettings();
+    });
     this.updateStatus();
+    return { applied: true };
   }
 
   async openSetup(): Promise<void> {
@@ -99,40 +130,62 @@ export default class VaultRelayPlugin extends Plugin {
       const remotes = await GoogleDriveRemote.list(this.auth);
       new SetupModal(this.app, this, remotes).open();
     } catch (error) {
-      this.reportError(error);
+      await this.reportError(error);
     }
   }
 
   async createRemote(): Promise<void> {
     const created = await GoogleDriveRemote.create(this.auth, this.app.vault.getName());
-    this.settings.layout = created.layout;
-    this.settings.syncState = createInitialState(this.settings.syncState.deviceId);
-    await this.saveSettings();
+    await this.rebind(created.layout);
     await this.syncNow(true);
     new Notice("Remote vault created and initial upload completed");
   }
 
   async linkRemote(remote: RemoteVaultSummary): Promise<void> {
-    this.settings.layout = remote.layout;
-    this.settings.syncState = createInitialState(this.settings.syncState.deviceId);
-    await this.saveSettings();
+    await this.rebind(remote.layout);
     await this.syncNow(true);
     new Notice(`Linked ${remote.name}`);
   }
 
-  async syncNow(showNotice: boolean): Promise<void> {
-    if (this.syncing) return;
+  /** Swapping the remote store resets sync state, so no sync may be in flight. */
+  private async rebind(layout: DriveLayout): Promise<void> {
+    await this.exclusive(async () => {
+      this.settings.layout = layout;
+      this.settings.syncState = createInitialState(this.settings.syncState.deviceId);
+      this.settings.conflicts = [];
+      this.settings.pendingLargeDeletionCount = 0;
+      await this.saveSettings();
+    });
+  }
+
+  /** Coalescing: concurrent callers join the running sync instead of no-oping. */
+  syncNow(showNotice: boolean): Promise<void> {
+    if (this.inFlight) return this.inFlight;
+    if (this.unloading) return Promise.resolve();
     if (this.settings.paused) {
       if (showNotice) new Notice("Vault Relay is paused");
-      return;
+      return Promise.resolve();
     }
     if (!this.settings.connected || !this.settings.layout) {
       if (showNotice) new Notice("Set up Vault Relay first");
-      return;
+      return Promise.resolve();
     }
-
     this.syncing = true;
     this.updateStatus();
+    this.inFlight = this.exclusive(() => this.runSync(showNotice)).finally(() => {
+      this.inFlight = null;
+      this.syncing = false;
+      this.updateStatus();
+    });
+    return this.inFlight;
+  }
+
+  private async runSync(showNotice: boolean): Promise<void> {
+    const layout = this.settings.layout;
+    // Both can change while this call waits its turn behind the lock.
+    if (!layout || this.unloading) return;
+    const aborter = new AbortController();
+    this.aborter = aborter;
     try {
       const states: StateRepository = {
         load: async () => structuredClone(this.settings.syncState),
@@ -146,9 +199,9 @@ export default class VaultRelayPlugin extends Plugin {
       await this.saveSettings();
       const engine = new SyncEngine(
         this.local,
-        new GoogleDriveRemote(this.auth, this.settings.layout, this.settings.maxConcurrentRequests),
+        new GoogleDriveRemote(this.auth, layout, this.settings.maxConcurrentRequests),
         states,
-        { allowLargeDeletes },
+        { allowLargeDeletes, signal: aborter.signal },
       );
       const result = await engine.sync();
       this.settings.lastSyncAt = new Date().toISOString();
@@ -162,62 +215,73 @@ export default class VaultRelayPlugin extends Plugin {
       }
     } catch (error) {
       if (error instanceof DestructiveSyncError) this.settings.pendingLargeDeletionCount = error.count;
-      this.reportError(error);
+      await this.reportError(error);
     } finally {
-      this.syncing = false;
-      this.updateStatus();
+      if (this.aborter === aborter) this.aborter = null;
     }
   }
 
   async restoreVersion(path: string, blobHash: string): Promise<void> {
     if (!this.settings.layout) throw new Error("Set up a remote vault first");
-    const remote = new GoogleDriveRemote(this.auth, this.settings.layout, this.settings.maxConcurrentRequests);
-    await this.local.write(path, await remote.getBlob(blobHash));
+    const layout = this.settings.layout;
+    await this.exclusive(async () => {
+      const remote = new GoogleDriveRemote(this.auth, layout, this.settings.maxConcurrentRequests);
+      await this.local.write(path, await remote.getBlob(blobHash));
+    });
     new Notice(`Restored ${path}; sync to publish it as the current version`);
   }
 
   async resolveConflict(path: string, keepCurrent: boolean): Promise<void> {
-    const state = this.settings.syncState;
-    const heads = headsForVersions(versionsByPath(state.operations).get(path) ?? new Map()).map((head) => head.operation.id);
-    if (heads.length < 2) throw new Error("This path no longer has concurrent versions");
-    const sequence = state.nextSequence;
-    let changes: SyncOperation["changes"];
-    if (keepCurrent) {
-      const file = (await this.local.scan()).find((candidate) => candidate.path === path);
-      if (!file) throw new Error("The current file does not exist; choose keep deleted instead");
-      const content = await this.local.read(path);
-      const hash = await sha256(content);
-      changes = [{ kind: "put", path, parents: heads, blobHash: hash, size: content.byteLength, mimeType: file.mimeType }];
-    } else {
-      await this.local.remove(path);
-      changes = [{ kind: "delete", path, parents: heads }];
-    }
-    state.pending.push({
-      protocolVersion: PROTOCOL_VERSION,
-      id: `${state.deviceId}-${sequence.toString(36)}-${crypto.randomUUID()}`,
-      deviceId: state.deviceId,
-      sequence,
-      createdAt: new Date().toISOString(),
-      changes,
+    // A running sync overwrites settings.syncState wholesale when it
+    // checkpoints, so mutating it concurrently silently dropped the resolution.
+    await this.exclusive(async () => {
+      const state = this.settings.syncState;
+      const heads = headsForVersions(versionsByPath(state.operations).get(path) ?? new Map()).map((head) => head.operation.id);
+      if (heads.length < 2) throw new Error("This path no longer has concurrent versions");
+      const sequence = state.nextSequence;
+      let changes: SyncOperation["changes"];
+      if (keepCurrent) {
+        const file = (await this.local.scan()).find((candidate) => candidate.path === path);
+        if (!file) throw new Error("The current file does not exist; choose keep deleted instead");
+        const content = await this.local.read(path);
+        const hash = await sha256(content);
+        changes = [{ kind: "put", path, parents: heads, blobHash: hash, size: content.byteLength, mimeType: file.mimeType }];
+      } else {
+        await this.local.remove(path);
+        changes = [{ kind: "delete", path, parents: heads }];
+      }
+      state.pending.push({
+        protocolVersion: PROTOCOL_VERSION,
+        id: `${state.deviceId}-${sequence.toString(36)}-${crypto.randomUUID()}`,
+        deviceId: state.deviceId,
+        sequence,
+        createdAt: new Date().toISOString(),
+        changes,
+      });
+      state.nextSequence += 1;
+      await this.saveSettings();
     });
-    state.nextSequence += 1;
-    await this.saveSettings();
     await this.syncNow(true);
   }
 
   async approveLargeDeletion(): Promise<void> {
     const count = this.settings.pendingLargeDeletionCount;
     if (!count) return;
-    this.settings.allowLargeDeletesOnce = true;
-    await this.saveSettings();
+    await this.exclusive(async () => {
+      this.settings.allowLargeDeletesOnce = true;
+      await this.saveSettings();
+    });
     new Notice(`Approved one sync that may trash ${count} files`);
     await this.syncNow(true);
   }
 
   resetTimer(): void {
     if (this.timer !== null) window.clearInterval(this.timer);
-    this.timer = window.setInterval(() => void this.syncNow(false), Math.max(1, this.settings.autoSyncMinutes) * 60_000);
-    this.registerInterval(this.timer);
+    if (this.unloading) return;
+    const minutes = Math.min(1_440, Math.max(1, this.settings.autoSyncMinutes));
+    // onunload clears this directly; registerInterval would accumulate a stale
+    // handle every time the interval setting changed.
+    this.timer = window.setInterval(() => void this.syncNow(false), minutes * 60_000);
   }
 
   updateStatus(): void {
@@ -245,15 +309,25 @@ export default class VaultRelayPlugin extends Plugin {
     await this.saveData(this.settings);
   }
 
+  /**
+   * Serializes everything that touches sync state or the vault. Without it a
+   * scheduled sync can interleave with conflict resolution or a restore and
+   * overwrite settings.syncState from its own snapshot.
+   */
+  private async exclusive<T>(run: () => Promise<T>): Promise<T> {
+    while (this.lock) await this.lock.catch(() => undefined);
+    let release = (): void => undefined;
+    this.lock = new Promise<void>((resolve) => { release = resolve; });
+    try {
+      return await run();
+    } finally {
+      this.lock = null;
+      release();
+    }
+  }
+
   private async loadSettings(): Promise<void> {
-    const loaded = (await this.loadData()) as Partial<PluginSettings> | null;
-    this.settings = {
-      ...structuredClone(DEFAULT_SETTINGS),
-      ...loaded,
-      syncState: loaded?.syncState ?? createInitialState(),
-      exclusions: loaded?.exclusions ?? [...DEFAULT_SETTINGS.exclusions],
-      conflicts: loaded?.conflicts ?? [],
-    };
+    this.settings = sanitizeSettings(await this.loadData());
   }
 
   private createStatusBar(): void {
@@ -265,9 +339,12 @@ export default class VaultRelayPlugin extends Plugin {
     this.statusDot = this.statusEl.createSpan({ cls: "vault-relay-status__dot" });
     this.statusText = this.statusEl.createSpan();
     const open = () => new ConflictModal(this.app, this).open();
-    this.statusEl.addEventListener("click", open);
-    this.statusEl.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" || event.key === " ") open();
+    this.registerDomEvent(this.statusEl, "click", open);
+    this.registerDomEvent(this.statusEl, "keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        open();
+      }
     });
     setIcon(this.statusDot, "circle");
   }
@@ -284,15 +361,23 @@ export default class VaultRelayPlugin extends Plugin {
       new Notice("Google Drive connected");
       await this.openSetup();
     } catch (error) {
-      this.reportError(error);
+      await this.reportError(error);
     }
   }
 
-  private reportError(error: unknown): void {
+  private async reportError(error: unknown): Promise<void> {
+    // An abort is the expected outcome of unloading, not a failure to record.
+    if (isAbort(error)) return;
     const message = error instanceof Error ? error.message : String(error);
-    this.settings.lastError = message.replace(/1\/[\w-]+|ya29\.[\w-]+/g, "[redacted]");
-    void this.saveSettings();
-    new Notice(`Vault Relay: ${this.settings.lastError}`);
-    this.updateStatus();
+    this.settings.lastError = redactTokens(message);
+    if (!this.unloading) {
+      try {
+        await this.saveSettings();
+      } catch {
+        // Reporting must not mask the original failure.
+      }
+      new Notice(`Vault Relay: ${this.settings.lastError}`);
+      this.updateStatus();
+    }
   }
 }

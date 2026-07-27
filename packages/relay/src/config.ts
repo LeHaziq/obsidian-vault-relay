@@ -1,3 +1,5 @@
+import { MIN_ENCRYPTION_KEY_LENGTH } from "./crypto.js";
+
 export interface Config {
   port: number;
   publicUrl: string;
@@ -14,6 +16,10 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Config
     if (!value) throw new Error(`Missing required environment variable ${name}`);
     return value;
   };
+  const encryptionKey = required("TOKEN_ENCRYPTION_KEY");
+  if (encryptionKey.length < MIN_ENCRYPTION_KEY_LENGTH) {
+    throw new Error(`TOKEN_ENCRYPTION_KEY must be at least ${MIN_ENCRYPTION_KEY_LENGTH} characters; generate one with: openssl rand -base64 48`);
+  }
   const parsedPublicUrl = new URL(required("PUBLIC_URL"));
   const loopback = parsedPublicUrl.hostname === "localhost" || parsedPublicUrl.hostname === "127.0.0.1" || parsedPublicUrl.hostname === "[::1]";
   if (parsedPublicUrl.protocol !== "https:" && !(parsedPublicUrl.protocol === "http:" && loopback)) throw new Error("PUBLIC_URL must use HTTPS outside exact loopback addresses");
@@ -27,7 +33,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Config
     publicUrl: parsedPublicUrl.origin,
     googleClientId: required("GOOGLE_CLIENT_ID"),
     googleClientSecret: required("GOOGLE_CLIENT_SECRET"),
-    encryptionKey: required("TOKEN_ENCRYPTION_KEY"),
+    encryptionKey,
     databasePath: environment.DATABASE_PATH ?? "./data/relay.sqlite",
     trustProxy: environment.TRUST_PROXY === "true",
   };

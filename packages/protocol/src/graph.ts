@@ -33,21 +33,32 @@ export function headsForVersions(versions: Map<string, VersionNode>): VersionNod
   return heads;
 }
 
+/**
+ * Iterative depth-first cycle check. A long single-path history can retain
+ * thousands of linked versions, so recursion here risks a stack overflow.
+ */
 function assertAcyclic(versions: Map<string, VersionNode>): void {
-  const visiting = new Set<string>();
   const visited = new Set<string>();
-  const visit = (id: string): void => {
-    if (visiting.has(id)) throw new Error(`Operation graph contains a cycle at ${id}`);
-    if (visited.has(id)) return;
-    visiting.add(id);
-    const node = versions.get(id);
-    for (const parent of node?.mutation.parents ?? []) {
-      if (versions.has(parent)) visit(parent);
+  const visiting = new Set<string>();
+  for (const root of versions.keys()) {
+    if (visited.has(root)) continue;
+    const stack: Array<{ id: string; entered: boolean }> = [{ id: root, entered: false }];
+    while (stack.length > 0) {
+      const frame = stack.pop()!;
+      if (frame.entered) {
+        visiting.delete(frame.id);
+        visited.add(frame.id);
+        continue;
+      }
+      if (visited.has(frame.id)) continue;
+      if (visiting.has(frame.id)) throw new Error(`Operation graph contains a cycle at ${frame.id}`);
+      visiting.add(frame.id);
+      stack.push({ id: frame.id, entered: true });
+      for (const parent of versions.get(frame.id)?.mutation.parents ?? []) {
+        if (versions.has(parent) && !visited.has(parent)) stack.push({ id: parent, entered: false });
+      }
     }
-    visiting.delete(id);
-    visited.add(id);
-  };
-  for (const id of versions.keys()) visit(id);
+  }
 }
 
 export function compareVersions(left: VersionNode, right: VersionNode): number {

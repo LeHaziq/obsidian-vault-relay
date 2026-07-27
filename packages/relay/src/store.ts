@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
-import { base64Url, digest, safeEqual, TokenCipher, verifierChallenge } from "./crypto.js";
+import { base64Url, digest, newKeySalt, safeEqual, TokenCipher, verifierChallenge } from "./crypto.js";
 
 interface AuthRow {
   nonce: string;
@@ -17,13 +17,18 @@ interface GrantRow {
   expires_at: number;
 }
 
+const SALT_KEY = "token_key_salt";
+
 export class GrantStore {
   private readonly cipher: TokenCipher;
 
   constructor(private readonly db: DatabaseSync, encryptionKey: string) {
-    this.cipher = new TokenCipher(encryptionKey);
     db.exec(`
       PRAGMA journal_mode = WAL;
+      CREATE TABLE IF NOT EXISTS relay_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      ) STRICT;
       CREATE TABLE IF NOT EXISTS auth_requests (
         nonce TEXT PRIMARY KEY,
         challenge TEXT NOT NULL,
@@ -40,6 +45,7 @@ export class GrantStore {
       CREATE INDEX IF NOT EXISTS auth_expiry ON auth_requests(expires_at);
       CREATE INDEX IF NOT EXISTS grant_expiry ON grants(expires_at);
     `);
+    this.cipher = new TokenCipher(encryptionKey, this.keySalt());
   }
 
   createAuthRequest(challenge: string, userState: string, returnTo: string, now = Date.now()): string {
@@ -51,10 +57,12 @@ export class GrantStore {
   }
 
   consumeAuthRequest(nonce: string, now = Date.now()): AuthRow | null {
-    const row = this.db.prepare("SELECT nonce, challenge, user_state, return_to, expires_at FROM auth_requests WHERE nonce = ?")
-      .get(nonce) as AuthRow | undefined;
-    this.db.prepare("DELETE FROM auth_requests WHERE nonce = ?").run(nonce);
-    return row && row.expires_at >= now ? row : null;
+    return this.transaction(() => {
+      const row = this.db.prepare("SELECT nonce, challenge, user_state, return_to, expires_at FROM auth_requests WHERE nonce = ?")
+        .get(nonce) as AuthRow | undefined;
+      this.db.prepare("DELETE FROM auth_requests WHERE nonce = ?").run(nonce);
+      return row && row.expires_at >= now ? row : null;
+    });
   }
 
   createGrant(challenge: string, refreshToken: string, now = Date.now()): string {
@@ -65,16 +73,46 @@ export class GrantStore {
   }
 
   claim(ticket: string, verifier: string, now = Date.now()): string | null {
-    const ticketHash = digest(ticket);
-    const row = this.db.prepare("SELECT ticket_hash, challenge, encrypted_token, expires_at FROM grants WHERE ticket_hash = ?")
-      .get(ticketHash) as GrantRow | undefined;
-    if (!row || row.expires_at < now || !safeEqual(row.challenge, verifierChallenge(verifier))) return null;
-    this.db.prepare("DELETE FROM grants WHERE ticket_hash = ?").run(ticketHash);
-    return this.cipher.decrypt(row.encrypted_token);
+    const encrypted = this.transaction(() => {
+      const ticketHash = digest(ticket);
+      const row = this.db.prepare("SELECT ticket_hash, challenge, encrypted_token, expires_at FROM grants WHERE ticket_hash = ?")
+        .get(ticketHash) as GrantRow | undefined;
+      if (!row || row.expires_at < now || !safeEqual(row.challenge, verifierChallenge(verifier))) return null;
+      this.db.prepare("DELETE FROM grants WHERE ticket_hash = ?").run(ticketHash);
+      return row.encrypted_token;
+    });
+    return encrypted === null ? null : this.cipher.decrypt(encrypted);
   }
 
   close(): void {
     this.db.close();
+  }
+
+  /**
+   * Read-then-delete has to be atomic so a second caller cannot observe a grant
+   * that is already being consumed. Single-instance deployments are safe by
+   * virtue of synchronous SQLite on one thread; this makes it structural.
+   */
+  private transaction<T>(run: () => T): T {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = run();
+      this.db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  private keySalt(): Buffer {
+    return this.transaction(() => {
+      const row = this.db.prepare("SELECT value FROM relay_meta WHERE key = ?").get(SALT_KEY) as { value: string } | undefined;
+      if (row) return Buffer.from(row.value, "base64");
+      const salt = newKeySalt();
+      this.db.prepare("INSERT INTO relay_meta(key, value) VALUES (?, ?)").run(SALT_KEY, salt.toString("base64"));
+      return salt;
+    });
   }
 
   private cleanup(now: number): void {

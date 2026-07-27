@@ -4,6 +4,10 @@ import { sha256 } from "./hash.js";
 import { PROTOCOL_VERSION, type Conflict, type LocalFile, type LocalVault, type Mutation, type RemoteVault, type StateRepository, type SyncEngineOptions, type SyncOperation, type SyncResult, type SyncState } from "./types.js";
 
 export const MAX_CHANGES_PER_OPERATION = 1_000;
+const DEFAULT_REPAIR_INTERVAL_MS = 6 * 60 * 60_000;
+const DEFAULT_CHECKPOINT_FILES = 50;
+const DEFAULT_CHECKPOINT_MS = 2_000;
+const MIME_TYPE_PATTERN = /^[A-Za-z0-9][\w.+-]*\/[A-Za-z0-9][\w.+-]*$/;
 
 export class DestructiveSyncError extends Error {
   constructor(public readonly count: number) {
@@ -33,8 +37,13 @@ export function validateOperation(value: SyncOperation): SyncOperation {
     if (!Array.isArray(mutation.parents) || new Set(mutation.parents).size !== mutation.parents.length || mutation.parents.includes(value.id) || mutation.parents.some((parent) => typeof parent !== "string" || parent.length < 1 || parent.length > 300)) {
       throw new Error(`Remote operation contains invalid parents: ${value.id}`);
     }
-    if (mutation.kind === "put" && (!/^[a-f0-9]{64}$/.test(mutation.blobHash) || !Number.isSafeInteger(mutation.size) || mutation.size < 0 || typeof mutation.mimeType !== "string")) {
+    if (mutation.kind === "put" && (!/^[a-f0-9]{64}$/.test(mutation.blobHash) || !Number.isSafeInteger(mutation.size) || mutation.size < 0)) {
       throw new Error(`Remote operation contains invalid content metadata: ${value.id}`);
+    }
+    // The MIME type is interpolated into multipart upload headers, so reject
+    // anything that is not a plain type/subtype token.
+    if (mutation.kind === "put" && (typeof mutation.mimeType !== "string" || mutation.mimeType.length > 255 || !MIME_TYPE_PATTERN.test(mutation.mimeType))) {
+      throw new Error(`Remote operation contains an invalid MIME type: ${value.id}`);
     }
   }
   return value;
@@ -49,7 +58,37 @@ export function createInitialState(deviceId: string = crypto.randomUUID()): Sync
     operations: {},
     materialized: {},
     pending: [],
+    lastRepairAt: null,
   };
+}
+
+/**
+ * Coalesces materialization progress writes. Persisting after every file makes
+ * a sync quadratic in vault size, because each save serializes the whole state.
+ * Losing a batch only costs a redundant no-op operation on the next sync: the
+ * content is already on disk, so it is re-recorded rather than re-transferred.
+ */
+class Checkpointer {
+  private dirty = 0;
+  private lastFlush = Date.now();
+
+  constructor(
+    private readonly save: () => Promise<void>,
+    private readonly everyFiles: number,
+    private readonly everyMs: number,
+  ) {}
+
+  async record(): Promise<void> {
+    this.dirty += 1;
+    if (this.dirty >= this.everyFiles || Date.now() - this.lastFlush >= this.everyMs) await this.flush();
+  }
+
+  async flush(): Promise<void> {
+    if (this.dirty === 0) return;
+    this.dirty = 0;
+    this.lastFlush = Date.now();
+    await this.save();
+  }
 }
 
 export class SyncEngine {
@@ -68,7 +107,12 @@ export class SyncEngine {
     return this.running;
   }
 
+  private checkAborted(): void {
+    this.options.signal?.throwIfAborted();
+  }
+
   private async run(): Promise<SyncResult> {
+    this.checkAborted();
     const state = await this.states.load();
     for (const operation of Object.values(state.operations)) validateOperation(operation);
     for (const operation of state.pending) validateOperation(operation);
@@ -88,19 +132,30 @@ export class SyncEngine {
       await this.states.save(state);
     }
 
+    this.checkAborted();
     const pulled = await this.remote.pullOperations(state.cursor);
     for (const operation of pulled.operations) {
       validateOperation(operation);
       const existing = state.operations[operation.id];
-      if (existing && JSON.stringify(existing) !== JSON.stringify(operation)) throw new Error(`Remote operation ID was reused with different content: ${operation.id}`);
+      if (existing && !sameOperation(existing, operation)) throw new Error(`Remote operation ID was reused with different content: ${operation.id}`);
       state.operations[operation.id] = operation;
     }
     state.cursor = pulled.cursor;
-    await this.remote.ensureOperations(Object.values(state.operations));
+
+    // Re-uploading every locally retained operation requires listing the whole
+    // remote operations folder, so run it on a schedule instead of every sync.
+    const repairIntervalMs = this.options.repairIntervalMs ?? DEFAULT_REPAIR_INTERVAL_MS;
+    const lastRepairAt = state.lastRepairAt ?? null;
+    if (lastRepairAt === null || Date.now() - lastRepairAt >= repairIntervalMs) {
+      this.checkAborted();
+      await this.remote.ensureOperations(Object.values(state.operations));
+      state.lastRepairAt = Date.now();
+    }
     await this.states.save(state);
 
     let uploadedOperations = 0;
     for (const operation of [...state.pending]) {
+      this.checkAborted();
       await this.uploadOperation(operation, localByPath);
       state.operations[operation.id] = operation;
       state.pending = state.pending.filter((candidate) => candidate.id !== operation.id);
@@ -108,7 +163,12 @@ export class SyncEngine {
       await this.states.save(state);
     }
 
-    const materialized = await this.materialize(state, localByPath, () => this.states.save(state));
+    const checkpoint = new Checkpointer(
+      () => this.states.save(state),
+      this.options.checkpointEveryFiles ?? DEFAULT_CHECKPOINT_FILES,
+      this.options.checkpointEveryMs ?? DEFAULT_CHECKPOINT_MS,
+    );
+    const materialized = await this.materialize(state, localByPath, checkpoint);
     compactOperations(state, this.options.retainedVersionsPerPath ?? 20);
     await this.states.save(state);
     return {
@@ -162,6 +222,7 @@ export class SyncEngine {
 
   private async uploadOperation(operation: SyncOperation, files: Map<string, LocalFile>): Promise<void> {
     for (const mutation of operation.changes) {
+      this.checkAborted();
       if (mutation.kind !== "put" || await this.remote.hasBlob(mutation.blobHash)) continue;
       const file = files.get(mutation.path);
       if (!file || file.hash !== mutation.blobHash) {
@@ -174,7 +235,7 @@ export class SyncEngine {
     await this.remote.putOperation(operation);
   }
 
-  private async materialize(state: SyncState, localFiles: Map<string, LocalFile>, checkpoint: () => Promise<void>): Promise<{ written: number; removed: number; conflicts: Conflict[] }> {
+  private async materialize(state: SyncState, localFiles: Map<string, LocalFile>, checkpoint: Checkpointer): Promise<{ written: number; removed: number; conflicts: Conflict[] }> {
     const paths = versionsByPath(state.operations);
     const desired = new Map<string, VersionNode>();
     const conflicts: Conflict[] = [];
@@ -212,45 +273,66 @@ export class SyncEngine {
     let removed = 0;
     const nextMaterialized: SyncState["materialized"] = {};
 
-    for (const [path, node] of desired) {
-      if (node.mutation.kind === "delete") {
-        if (localFiles.has(path)) {
+    try {
+      for (const [path, node] of desired) {
+        this.checkAborted();
+        if (node.mutation.kind === "delete") {
+          if (localFiles.has(path)) {
+            await this.local.remove(path);
+            localFiles.delete(path);
+            removed += 1;
+          }
+          delete state.materialized[path];
+          await checkpoint.record();
+          continue;
+        }
+        const current = localFiles.get(path);
+        if (current?.hash !== node.mutation.blobHash) {
+          const content = await this.remote.getBlob(node.mutation.blobHash);
+          if (content.byteLength !== node.mutation.size || await sha256(content) !== node.mutation.blobHash) {
+            throw new Error(`Remote content failed integrity verification: ${path}`);
+          }
+          await this.local.write(path, content);
+          written += 1;
+        }
+        nextMaterialized[path] = { hash: node.mutation.blobHash, operationId: node.operation.id };
+        state.materialized[path] = nextMaterialized[path];
+        await checkpoint.record();
+      }
+
+      for (const path of Object.keys(state.materialized)) {
+        this.checkAborted();
+        if (!this.local.isManaged(path)) {
+          const prior = state.materialized[path];
+          if (prior) nextMaterialized[path] = prior;
+        } else if (!desired.has(path) && localFiles.has(path)) {
           await this.local.remove(path);
-          localFiles.delete(path);
+          delete state.materialized[path];
+          await checkpoint.record();
           removed += 1;
         }
-        delete state.materialized[path];
-        await checkpoint();
-        continue;
       }
-      const current = localFiles.get(path);
-      if (current?.hash !== node.mutation.blobHash) {
-        const content = await this.remote.getBlob(node.mutation.blobHash);
-        if (content.byteLength !== node.mutation.size || await sha256(content) !== node.mutation.blobHash) {
-          throw new Error(`Remote content failed integrity verification: ${path}`);
-        }
-        await this.local.write(path, content);
-        written += 1;
-      }
-      nextMaterialized[path] = { hash: node.mutation.blobHash, operationId: node.operation.id };
-      state.materialized[path] = nextMaterialized[path];
-      await checkpoint();
+      state.materialized = nextMaterialized;
+    } finally {
+      // Persist whatever progress was made, including on abort or failure.
+      await checkpoint.flush();
     }
-
-    for (const path of Object.keys(state.materialized)) {
-      if (!this.local.isManaged(path)) {
-        const prior = state.materialized[path];
-        if (prior) nextMaterialized[path] = prior;
-      } else if (!desired.has(path) && localFiles.has(path)) {
-        await this.local.remove(path);
-        delete state.materialized[path];
-        await checkpoint();
-        removed += 1;
-      }
-    }
-    state.materialized = nextMaterialized;
     return { written, removed, conflicts };
   }
+}
+
+function sameOperation(left: SyncOperation, right: SyncOperation): boolean {
+  if (left === right) return true;
+  if (left.id !== right.id || left.deviceId !== right.deviceId || left.sequence !== right.sequence
+    || left.createdAt !== right.createdAt || left.changes.length !== right.changes.length) return false;
+  return left.changes.every((mutation, index) => {
+    const other = right.changes[index]!;
+    if (mutation.kind !== other.kind || mutation.path !== other.path) return false;
+    if (mutation.parents.length !== other.parents.length) return false;
+    if (!mutation.parents.every((parent, at) => parent === other.parents[at])) return false;
+    if (mutation.kind !== "put" || other.kind !== "put") return true;
+    return mutation.blobHash === other.blobHash && mutation.size === other.size && mutation.mimeType === other.mimeType;
+  });
 }
 
 export function compactOperations(state: SyncState, retainedVersionsPerPath: number): void {

@@ -7,12 +7,12 @@ Do not open a public issue containing OAuth credentials, tokens, vault content, 
 ## Relay deployment
 
 - Terminate TLS with a maintained reverse proxy or load balancer.
-- Keep `GOOGLE_CLIENT_SECRET` and `TOKEN_ENCRYPTION_KEY` in a secret manager.
+- Keep `GOOGLE_CLIENT_SECRET` and `TOKEN_ENCRYPTION_KEY` in a secret manager. `TOKEN_ENCRYPTION_KEY` must be at least 32 characters and should come from a CSPRNG; the relay derives the AES key with scrypt over a salt persisted in the database, so a weak key is expensive but not impossible to attack offline.
 - Persist `/app/data` and restrict it to the relay process.
 - Do not place request bodies, query strings, or response headers in proxy access logs. OAuth callback query strings contain short-lived authorization codes.
 - Set `TRUST_PROXY=true` only when the trusted proxy overwrites `X-Forwarded-For`; otherwise clients can spoof rate-limit identities.
 - Restrict administrative access and apply upstream request limits in addition to the relay's per-process limiter.
-- Run one relay instance per SQLite volume. Multi-instance deployments should replace SQLite with a shared transactional grant store.
+- Run one relay instance per SQLite volume. Grant consumption is transactional, but SQLite over a shared volume is not a safe multi-writer store; multi-instance deployments should replace it with a shared transactional grant store.
 - Keep Node.js and the container base image patched.
 
 ## Threat boundaries

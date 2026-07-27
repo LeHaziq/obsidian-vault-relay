@@ -1,6 +1,42 @@
 import { App, Modal, Notice, PluginSettingTab, Setting } from "obsidian";
 import type VaultRelayPlugin from "./main";
 import type { RemoteVaultSummary } from "./google-drive";
+import { MAX_CONCURRENCY, MIN_CONCURRENCY, SYNC_INTERVAL_CHOICES } from "./model";
+
+export class ConfirmModal extends Modal {
+  private decided = false;
+
+  constructor(
+    app: App,
+    private readonly title: string,
+    private readonly body: string,
+    private readonly confirmText: string,
+    private readonly resolve: (confirmed: boolean) => void,
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.setTitle(this.title);
+    this.contentEl.createEl("p", { text: this.body });
+    new Setting(this.contentEl)
+      .addButton((button) => button.setButtonText("Cancel").onClick(() => this.close()))
+      .addButton((button) => button.setButtonText(this.confirmText).setWarning().onClick(() => {
+        this.decided = true;
+        this.resolve(true);
+        this.close();
+      }));
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+    if (!this.decided) this.resolve(false);
+  }
+}
+
+function confirmAction(app: App, title: string, body: string, confirmText: string): Promise<boolean> {
+  return new Promise((resolve) => new ConfirmModal(app, title, body, confirmText, resolve).open());
+}
 
 export class AuthorizationModal extends Modal {
   constructor(app: App, private readonly authorizationUrl: string) {
@@ -39,13 +75,42 @@ export class VaultRelaySettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("OAuth relay URL")
-      .setDesc("HTTPS address of your deployed Vault Relay authentication service.")
-      .addText((text) => text
-        .setPlaceholder("https://auth.example.com")
-        .setValue(this.plugin.settings.relayUrl)
-        .onChange(async (value) => {
-          await this.plugin.updateRelayUrl(value);
-        }));
+      .setDesc("HTTPS address of your deployed Vault Relay authentication service. Applied when you leave the field or press Enter.")
+      .addText((text) => {
+        text.setPlaceholder("https://auth.example.com").setValue(this.plugin.settings.relayUrl);
+        let committing = false;
+        const commit = async (): Promise<void> => {
+          // Committing per keystroke tore down the Google credential partway
+          // through typing, because prefixes such as "https://a" are valid.
+          if (committing) return;
+          const value = text.inputEl.value.trim();
+          if (!value || value === this.plugin.settings.relayUrl) return;
+          committing = true;
+          try {
+            const result = await this.plugin.updateRelayUrl(value, () => confirmAction(
+              this.app,
+              "Change the OAuth relay?",
+              "This signs out of Google Drive and unlinks the remote vault on this device. Your notes are not deleted, and you can reconnect afterwards.",
+              "Change and sign out",
+            ));
+            if (result.applied) {
+              this.display();
+              return;
+            }
+            if (result.error) new Notice(result.error);
+            text.setValue(this.plugin.settings.relayUrl);
+          } finally {
+            committing = false;
+          }
+        };
+        text.inputEl.addEventListener("blur", () => void commit());
+        text.inputEl.addEventListener("keydown", (event) => {
+          if (event.key === "Enter") {
+            event.preventDefault();
+            text.inputEl.blur();
+          }
+        });
+      });
 
     new Setting(containerEl)
       .setName(this.plugin.settings.connected ? "Google Drive connected" : "Connect Google Drive")
@@ -68,12 +133,29 @@ export class VaultRelaySettingTab extends PluginSettingTab {
       .setName("Automatic sync interval")
       .setDesc("Sync while Obsidian is open. iOS does not run community plugins continuously in the background.")
       .addDropdown((dropdown) => dropdown
-        .addOptions({ "1": "Every minute", "5": "Every 5 minutes", "15": "Every 15 minutes", "30": "Every 30 minutes" })
+        .addOptions(Object.fromEntries(SYNC_INTERVAL_CHOICES.map((minutes) => [
+          String(minutes),
+          minutes === 1 ? "Every minute" : `Every ${minutes} minutes`,
+        ])))
         .setValue(String(this.plugin.settings.autoSyncMinutes))
         .onChange(async (value) => {
-          this.plugin.settings.autoSyncMinutes = Number(value);
+          const minutes = Number(value);
+          if (!Number.isFinite(minutes) || minutes < 1) return;
+          this.plugin.settings.autoSyncMinutes = minutes;
           await this.plugin.saveSettings();
           this.plugin.resetTimer();
+        }));
+
+    new Setting(containerEl)
+      .setName("Parallel Drive requests")
+      .setDesc(`How many Google Drive transfers run at once (${MIN_CONCURRENCY}-${MAX_CONCURRENCY}). Lower this on a slow or metered connection.`)
+      .addSlider((slider) => slider
+        .setLimits(MIN_CONCURRENCY, MAX_CONCURRENCY, 1)
+        .setValue(this.plugin.settings.maxConcurrentRequests)
+        .setDynamicTooltip()
+        .onChange(async (value) => {
+          this.plugin.settings.maxConcurrentRequests = value;
+          await this.plugin.saveSettings();
         }));
 
     new Setting(containerEl)
@@ -89,7 +171,7 @@ export class VaultRelaySettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Excluded paths")
-      .setDesc("One exact path or folder prefix per line. The .obsidian folder is excluded by default.")
+      .setDesc("One rule per line. A trailing slash excludes a folder, a name without a slash excludes that file name at any depth, and anything else is an exact path. The .obsidian folder is always excluded.")
       .addTextArea((text) => text
         .setValue(this.plugin.settings.exclusions.join("\n"))
         .onChange(async (value) => {

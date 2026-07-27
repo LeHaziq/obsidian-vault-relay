@@ -3,30 +3,53 @@ import type { Config } from "./config.js";
 import type { GrantStore } from "./store.js";
 
 const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_REQUESTS = 120;
+/** Hard ceiling on tracked rate-limit buckets, to bound memory under a flood. */
+const RATE_LIMIT_MAX_ENTRIES = 20_000;
 
 export class RelayApp {
   private readonly rates = new Map<string, { count: number; resetAt: number }>();
+  private readonly sweeper: NodeJS.Timeout;
 
   constructor(
     private readonly config: Config,
     private readonly store: GrantStore,
     private readonly tokenFetch: typeof fetch = fetch,
-  ) {}
+  ) {
+    // Sweeping on a timer keeps the O(n) scan off the request path, where it
+    // previously ran on every request once the map exceeded its threshold.
+    this.sweeper = setInterval(() => this.sweepRates(), RATE_LIMIT_WINDOW_MS);
+    this.sweeper.unref();
+  }
+
+  dispose(): void {
+    clearInterval(this.sweeper);
+  }
 
   async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const started = Date.now();
     const url = new URL(request.url ?? "/", this.config.publicUrl);
     try {
-      if (request.method === "GET" && url.pathname === "/health") return this.json(response, 200, { status: "ok" });
       this.rateLimit(request, url.pathname);
+      if (request.method === "GET" && url.pathname === "/health") return this.json(response, 200, { status: "ok" });
       if (request.method === "GET" && url.pathname === "/oauth/start") return this.start(url, response);
-      if (request.method === "GET" && url.pathname === "/oauth/callback") return this.callback(url, response);
-      if (request.method === "POST" && url.pathname === "/oauth/claim") return this.claim(request, response);
-      if (request.method === "POST" && url.pathname === "/oauth/refresh") return this.refresh(request, response);
+      // These must be awaited inside the try block. `return somePromise` in an
+      // async function settles the outer promise without routing rejections
+      // through this catch, so every async route's error path escaped it.
+      if (request.method === "GET" && url.pathname === "/oauth/callback") return await this.callback(url, response);
+      if (request.method === "POST" && url.pathname === "/oauth/claim") return await this.claim(request, response);
+      if (request.method === "POST" && url.pathname === "/oauth/refresh") return await this.refresh(request, response);
       this.json(response, 404, { error: "Not found" });
     } catch (error) {
       const status = error instanceof HttpError ? error.status : 500;
-      this.json(response, status, { error: status === 500 ? "Internal server error" : error instanceof Error ? error.message : String(error) });
+      if (status === 500) {
+        // Without this the cause of every 500 was discarded, leaving operators
+        // with a generic body and no server-side record.
+        console.error(JSON.stringify({ message: "Request failed", path: url.pathname, error: error instanceof Error ? error.message : String(error) }));
+      }
+      if (response.headersSent) response.destroy();
+      else this.json(response, status, { error: status === 500 ? "Internal server error" : error instanceof Error ? error.message : String(error) });
     } finally {
       console.info(JSON.stringify({ method: request.method, path: url.pathname, status: response.statusCode, duration_ms: Date.now() - started }));
     }
@@ -57,7 +80,7 @@ export class RelayApp {
     const request = this.store.consumeAuthRequest(nonce);
     if (!request) throw new HttpError(400, "Authorization request expired or was already used");
     const oauthError = url.searchParams.get("error");
-    if (oauthError) throw new HttpError(400, `Google authorization failed: ${oauthError}`);
+    if (oauthError) throw new HttpError(400, `Google authorization failed: ${sanitizeOAuthError(oauthError)}`);
     const code = url.searchParams.get("code");
     if (!code) throw new HttpError(400, "Google did not return an authorization code");
     const token = await this.googleToken({
@@ -78,7 +101,10 @@ export class RelayApp {
 
   private async claim(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const body = await readJson(request) as { ticket?: string; verifier?: string };
-    if (!body.ticket || !body.verifier) throw new HttpError(400, "Ticket and verifier are required");
+    if (typeof body?.ticket !== "string" || typeof body?.verifier !== "string" || !body.ticket || !body.verifier
+      || body.ticket.length > 512 || body.verifier.length > 512) {
+      throw new HttpError(400, "Ticket and verifier are required");
+    }
     const refreshToken = this.store.claim(body.ticket, body.verifier);
     if (!refreshToken) throw new HttpError(401, "Grant expired, was already used, or verifier did not match");
     this.json(response, 200, { refresh_token: refreshToken });
@@ -86,7 +112,9 @@ export class RelayApp {
 
   private async refresh(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const body = await readJson(request) as { refresh_token?: string };
-    if (!body.refresh_token || body.refresh_token.length > 4096) throw new HttpError(400, "Refresh token is required");
+    if (typeof body?.refresh_token !== "string" || !body.refresh_token || body.refresh_token.length > 4096) {
+      throw new HttpError(400, "Refresh token is required");
+    }
     try {
       const token = await this.googleToken({
         refresh_token: body.refresh_token,
@@ -108,8 +136,8 @@ export class RelayApp {
       body: new URLSearchParams(values),
       signal: AbortSignal.timeout(15_000),
     });
-    const body = await result.json() as { access_token?: string; expires_in?: number; token_type?: string; refresh_token?: string; error?: string };
-    if (!result.ok || !body.access_token) throw new GoogleTokenError(body.error ?? `HTTP ${result.status}`);
+    const body = await result.json().catch(() => ({})) as { access_token?: string; expires_in?: number; token_type?: string; refresh_token?: string; error?: string };
+    if (!result.ok || !body.access_token) throw new GoogleTokenError(sanitizeOAuthError(body.error) || `HTTP ${result.status}`);
     return {
       access_token: body.access_token,
       expires_in: body.expires_in ?? 3600,
@@ -119,22 +147,32 @@ export class RelayApp {
   }
 
   private rateLimit(request: IncomingMessage, path: string): void {
-    const forwarded = this.config.trustProxy ? request.headers["x-forwarded-for"]?.toString().split(",")[0]?.trim() : undefined;
-    const address = forwarded && forwarded.length <= 64 ? forwarded : request.socket.remoteAddress ?? "unknown";
-    const key = `${address}:${path}`;
+    const key = `${this.clientAddress(request)}:${path}`;
     const now = Date.now();
-    if (this.rates.size > 10_000) {
-      for (const [address, rate] of this.rates) {
-        if (rate.resetAt < now) this.rates.delete(address);
-      }
-    }
     const current = this.rates.get(key);
     if (!current || current.resetAt < now) {
-      this.rates.set(key, { count: 1, resetAt: now + 60_000 });
+      if (this.rates.size >= RATE_LIMIT_MAX_ENTRIES) this.sweepRates(now);
+      this.rates.set(key, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
       return;
     }
     current.count += 1;
-    if (current.count > 120) throw new HttpError(429, "Too many requests");
+    if (current.count > RATE_LIMIT_REQUESTS) throw new HttpError(429, "Too many requests");
+  }
+
+  private clientAddress(request: IncomingMessage): string {
+    const forwarded = this.config.trustProxy ? request.headers["x-forwarded-for"]?.toString().split(",")[0]?.trim() : undefined;
+    const raw = forwarded && forwarded.length > 0 && forwarded.length <= 64 ? forwarded : request.socket.remoteAddress ?? "unknown";
+    return normalizeAddress(raw);
+  }
+
+  private sweepRates(now = Date.now()): void {
+    for (const [key, rate] of this.rates) {
+      if (rate.resetAt < now) this.rates.delete(key);
+    }
+    if (this.rates.size <= RATE_LIMIT_MAX_ENTRIES) return;
+    // Still over budget with every bucket live: drop the ones expiring soonest.
+    const ordered = [...this.rates.entries()].sort((left, right) => left[1].resetAt - right[1].resetAt);
+    for (const [key] of ordered.slice(0, this.rates.size - RATE_LIMIT_MAX_ENTRIES)) this.rates.delete(key);
   }
 
   private json(response: ServerResponse, status: number, body: unknown): void {
@@ -154,6 +192,34 @@ class HttpError extends Error {
 
 class GoogleTokenError extends Error {
   constructor(public readonly oauthCode: string) { super(`Google token request failed: ${oauthCode}`); }
+}
+
+/** OAuth error codes are echoed back to clients, so keep them to a safe token. */
+function sanitizeOAuthError(value: string | undefined): string {
+  if (!value) return "";
+  return /^[A-Za-z0-9_-]{1,64}$/.test(value) ? value : "invalid_response";
+}
+
+/**
+ * Collapses an IPv6 address to its /64 prefix so a single allocation cannot
+ * mint unlimited rate-limit buckets. IPv4 addresses pass through unchanged.
+ */
+export function normalizeAddress(value: string): string {
+  const unbracketed = value.startsWith("[") && value.endsWith("]") ? value.slice(1, -1) : value;
+  const address = (unbracketed.split("%")[0] ?? "").toLowerCase();
+  const mapped = address.startsWith("::ffff:") ? address.slice(7) : address;
+  if (!mapped.includes(":")) return mapped || "unknown";
+  let groups: string[];
+  if (mapped.includes("::")) {
+    const [head = "", tail = ""] = mapped.split("::");
+    const headGroups = head ? head.split(":") : [];
+    const tailGroups = tail ? tail.split(":") : [];
+    const missing = Math.max(0, 8 - headGroups.length - tailGroups.length);
+    groups = [...headGroups, ...Array<string>(missing).fill("0"), ...tailGroups];
+  } else {
+    groups = mapped.split(":");
+  }
+  return `${groups.slice(0, 4).map((group) => (group.replace(/^0+/, "") || "0")).join(":")}::/64`;
 }
 
 async function readJson(request: IncomingMessage): Promise<unknown> {

@@ -163,7 +163,11 @@ describe("SyncEngine", () => {
     remote.putBlob = original;
     await current.engine.sync();
     expect(local.text("second.md")).toBe("newer local edit");
-    expect(remote.operations.size).toBe(3);
+    // Assert on what was published rather than on how changes were batched.
+    const published = [...remote.operations.values()].flatMap((operation) => operation.changes);
+    expect(published.filter((change) => change.path === "first.md")).toHaveLength(2);
+    expect(published.filter((change) => change.path === "second.md")).toHaveLength(2);
+    expect(current.states.state.pending).toHaveLength(0);
   });
 
   it("rejects corrupt downloaded content before writing", async () => {
@@ -216,6 +220,99 @@ describe("SyncEngine", () => {
     await device(local, remote, "device").engine.sync();
     expect(remote.operations.size).toBe(2);
     expect([...remote.operations.values()].every((operation) => operation.changes.length <= 1_000)).toBe(true);
+  });
+
+  it("rejects a MIME type that could inject multipart headers", () => {
+    const operation = (mimeType: string): SyncOperation => ({
+      protocolVersion: 1,
+      id: "op",
+      deviceId: "device",
+      sequence: 1,
+      createdAt: new Date().toISOString(),
+      changes: [{ kind: "put", path: "a.md", parents: [], blobHash: "a".repeat(64), size: 1, mimeType }],
+    });
+    for (const bad of ["text/markdown\r\nContent-Type: evil", "not-a-mime", "", "a/b/c", "text /markdown", "x".repeat(300)]) {
+      expect(() => validateOperation(operation(bad))).toThrow("invalid MIME type");
+    }
+    for (const good of ["text/markdown", "application/octet-stream", "image/svg+xml", "audio/mpeg"]) {
+      expect(() => validateOperation(operation(good))).not.toThrow();
+    }
+  });
+
+  it("stops between steps when the caller aborts", async () => {
+    const remote = new MemoryRemote();
+    const source = new MemoryLocal();
+    for (let index = 0; index < 20; index += 1) source.set(`notes/${index}.md`, `body ${index}`);
+    await device(source, remote, "source").engine.sync();
+
+    const destination = new MemoryLocal();
+    const states = new MemoryState(createInitialState("destination"));
+    const controller = new AbortController();
+    let downloaded = 0;
+    const original = remote.getBlob.bind(remote);
+    remote.getBlob = async (hash: string) => {
+      downloaded += 1;
+      if (downloaded === 3) controller.abort();
+      return original(hash);
+    };
+    const engine = new SyncEngine(destination, remote, states, { signal: controller.signal });
+    await expect(engine.sync()).rejects.toMatchObject({ name: "AbortError" });
+    expect(destination.files.size).toBeLessThan(20);
+    // Progress made before the abort is persisted, so a later sync resumes.
+    remote.getBlob = original;
+    await new SyncEngine(destination, remote, states).sync();
+    expect(destination.files.size).toBe(20);
+  });
+
+  it("persists materialization progress without saving once per file", async () => {
+    const remote = new MemoryRemote();
+    const source = new MemoryLocal();
+    for (let index = 0; index < 40; index += 1) source.set(`notes/${index}.md`, `body ${index}`);
+    await device(source, remote, "source").engine.sync();
+
+    const destination = new MemoryLocal();
+    const states = new MemoryState(createInitialState("destination"));
+    let saves = 0;
+    const counting: StateRepository = {
+      load: () => states.load(),
+      save: async (state) => { saves += 1; await states.save(state); },
+    };
+    await new SyncEngine(destination, remote, counting, { checkpointEveryFiles: 50, checkpointEveryMs: 60_000 }).sync();
+    expect(destination.files.size).toBe(40);
+    // Previously this was one full-state write per materialized file.
+    expect(saves).toBeLessThan(10);
+  });
+
+  it("repairs missing remote operations on a schedule rather than every sync", async () => {
+    const remote = new MemoryRemote();
+    const local = new MemoryLocal();
+    local.set("note.md", "hello");
+    const states = new MemoryState(createInitialState("device"));
+    let repairs = 0;
+    const original = remote.ensureOperations.bind(remote);
+    remote.ensureOperations = async (operations) => { repairs += 1; await original(operations); };
+
+    const engine = new SyncEngine(local, remote, states, { repairIntervalMs: 60_000 });
+    await engine.sync();
+    expect(repairs).toBe(1);
+    await new SyncEngine(local, remote, states, { repairIntervalMs: 60_000 }).sync();
+    expect(repairs).toBe(1);
+    states.state.lastRepairAt = Date.now() - 120_000;
+    await new SyncEngine(local, remote, states, { repairIntervalMs: 60_000 }).sync();
+    expect(repairs).toBe(2);
+  });
+
+  it("re-uploads an operation the remote store lost during a repair pass", async () => {
+    const remote = new MemoryRemote();
+    const local = new MemoryLocal();
+    local.set("note.md", "hello");
+    const states = new MemoryState(createInitialState("device"));
+    await new SyncEngine(local, remote, states).sync();
+    expect(remote.operations.size).toBe(1);
+    remote.operations.clear();
+    states.state.lastRepairAt = null;
+    await new SyncEngine(local, remote, states).sync();
+    expect(remote.operations.size).toBe(1);
   });
 
   it("requires one-time approval for bulk remote deletion", async () => {

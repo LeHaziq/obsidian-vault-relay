@@ -1,3 +1,4 @@
+export * from "./concurrency.js";
 export * from "./engine.js";
 export * from "./graph.js";
 export * from "./hash.js";

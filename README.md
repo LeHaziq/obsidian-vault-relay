@@ -60,7 +60,7 @@ The `drive.file` scope limits the plugin to files it creates. It does not grant 
 
 ## Deploy the OAuth relay
 
-Create a random encryption key:
+Create a random encryption key. It must be at least 32 characters; the relay refuses to start with a shorter one.
 
 ```bash
 openssl rand -base64 48
@@ -109,6 +109,8 @@ Linking a remote store to a non-empty local vault is allowed. Local and remote v
 ## Operation
 
 - Sync runs at startup, at the configured interval, or from **Vault Relay: Sync now**. Ordinary edits wait for the next configured interval.
+- **Excluded paths** takes one rule per line: a trailing slash excludes a folder and its contents, a bare name without a slash excludes that file name at any depth, and anything else is an exact path. `.obsidian` is always excluded.
+- Changes to the **OAuth relay URL** apply when the field loses focus or you press Enter, and ask for confirmation first because switching relays signs the device out of Google Drive.
 - The status bar reports setup, syncing, paused, error, and conflict states.
 - **Show conflicts** lists preserved concurrent versions.
 - Resolve a conflict by comparing or copying the desired content, then use **Keep current file** or **Keep deleted**. Resolution creates a new operation descended from every conflicting head and cleans up generated copies.
@@ -122,12 +124,12 @@ Obsidian community plugins run only while Obsidian is active. iOS does not allow
 ## Security properties
 
 - Refresh tokens use Obsidian `SecretStorage`, never plugin `data.json`.
-- OAuth callbacks use state validation, a verifier-bound claim ticket, expiration, and single-use database deletion.
-- Pending refresh tokens are encrypted with AES-256-GCM.
+- OAuth callbacks use state validation, a verifier-bound claim ticket, expiration, and single-use deletion inside a database transaction.
+- Pending refresh tokens are encrypted with AES-256-GCM under a scrypt-derived key. `TOKEN_ENCRYPTION_KEY` must be at least 32 characters; the relay refuses to start otherwise.
 - The relay does not proxy vault content.
-- Google API retries use bounded exponential backoff.
-- Logs contain method, route, status, and timing only; request bodies and tokens are not logged.
-- Local paths are normalized, traversal is rejected, and case collisions stop sync before writes.
+- Google API requests retry with bounded exponential backoff on throttling and server errors. Non-idempotent uploads retry only on `503`, where the request was shed rather than possibly applied.
+- Logs contain method, route, status, and timing only; request bodies and tokens are not logged. Credentials are stripped from any error text the plugin persists or displays.
+- Local paths are normalized and traversal is rejected at both the protocol layer and the vault adapter; case collisions stop sync before writes.
 
 See [SECURITY.md](SECURITY.md) for reporting and deployment guidance.
 
@@ -139,7 +141,13 @@ npm run typecheck
 npm run build
 ```
 
-The protocol tests cover initial replication, deletion, concurrent offline edits, commit ordering, path traversal, case collisions, and single-use OAuth grants. Real-device validation is still required before publishing a community-plugin release.
+Test coverage:
+
+- `packages/protocol`: initial replication, deletion, concurrent offline edits, commit ordering, blob integrity, path traversal, case collisions, MIME validation, cycle detection over long histories, checkpoint batching, scheduled remote repair, abort and resume.
+- `packages/relay`: the OAuth HTTP surface end to end over a real server — start parameter validation, redirect target restriction, nonce replay, verifier binding, single-use grants, `invalid_grant` mapping, body limits, response headers, and rate limiting — plus cipher round-trip and tamper rejection.
+- `packages/plugin`: relay origin and callback URL construction, credential redaction, persisted-settings validation, exclusion matching, hash caching, path traversal rejection, and the Drive retry policy.
+
+Real-device validation is still required before publishing a community-plugin release.
 
 ## License
 

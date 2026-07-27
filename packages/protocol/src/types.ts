@@ -47,6 +47,11 @@ export interface SyncState {
   operations: Record<string, SyncOperation>;
   materialized: Record<string, MaterializedFile>;
   pending: SyncOperation[];
+  /**
+   * Timestamp of the last full remote-operation repair pass. Optional so states
+   * written by earlier versions still load; absent means "repair on next sync".
+   */
+  lastRepairAt?: number | null;
 }
 
 export interface LocalFile {
@@ -95,4 +100,12 @@ export interface SyncResult {
 export interface SyncEngineOptions {
   allowLargeDeletes?: boolean;
   retainedVersionsPerPath?: number;
+  /** How often to re-upload locally retained operations missing from the remote store. */
+  repairIntervalMs?: number;
+  /** Persist materialization progress after this many files. */
+  checkpointEveryFiles?: number;
+  /** Persist materialization progress after this many milliseconds. */
+  checkpointEveryMs?: number;
+  /** Aborts an in-flight sync between steps, e.g. when the plugin unloads. */
+  signal?: AbortSignal;
 }
