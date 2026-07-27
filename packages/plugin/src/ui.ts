@@ -2,6 +2,31 @@ import { App, Modal, Notice, PluginSettingTab, Setting } from "obsidian";
 import type VaultRelayPlugin from "./main";
 import type { RemoteVaultSummary } from "./google-drive";
 
+export class AuthorizationModal extends Modal {
+  constructor(app: App, private readonly authorizationUrl: string) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.setTitle("Connect Google Drive");
+    this.contentEl.createEl("p", {
+      text: "Continue in your system browser to sign in with Google. After approval, Safari will ask to open Obsidian again.",
+    });
+    const link = this.contentEl.createEl("a", {
+      text: "Continue in Safari",
+      cls: "mod-cta vault-relay-authorization-link",
+      href: this.authorizationUrl,
+    });
+    link.setAttr("target", "_blank");
+    link.setAttr("rel", "noopener noreferrer");
+    link.addEventListener("click", () => window.setTimeout(() => this.close(), 0));
+    this.contentEl.createEl("p", {
+      cls: "vault-relay-setting-note",
+      text: "The authorization request expires after 10 minutes. Return here and press Connect again if it expires.",
+    });
+  }
+}
+
 export class VaultRelaySettingTab extends PluginSettingTab {
   constructor(app: App, private readonly plugin: VaultRelayPlugin) {
     super(app, plugin);

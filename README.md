@@ -108,7 +108,7 @@ Linking a remote store to a non-empty local vault is allowed. Local and remote v
 
 ## Operation
 
-- Sync runs at startup, after a short local-change debounce, at the configured interval, or from **Vault Relay: Sync now**.
+- Sync runs at startup, at the configured interval, or from **Vault Relay: Sync now**. Ordinary edits wait for the next configured interval.
 - The status bar reports setup, syncing, paused, error, and conflict states.
 - **Show conflicts** lists preserved concurrent versions.
 - Resolve a conflict by comparing or copying the desired content, then use **Keep current file** or **Keep deleted**. Resolution creates a new operation descended from every conflicting head and cleans up generated copies.

@@ -1,5 +1,6 @@
 import { requestUrl, type App } from "obsidian";
 import { sha256 } from "@vault-relay/protocol";
+import { buildAuthorizationUrl } from "./oauth-url";
 import { normalizeRelayOrigin, safeRelayOrigin } from "./relay-url";
 
 const SECRET_ID = "vault-relay-google-refresh-token";
@@ -33,21 +34,20 @@ export class GoogleAuth {
 
   constructor(private readonly app: App, private readonly relayUrl: () => string) {}
 
-  async begin(): Promise<void> {
-    const popup = window.open("about:blank", "_blank");
-    if (popup) popup.opener = null;
+  async prepareAuthorization(): Promise<string> {
     const verifier = randomVerifier();
     const state = crypto.randomUUID();
     const relayOrigin = normalizeRelayOrigin(this.relayUrl());
+    const health = await requestUrl({
+      url: new URL("/health", relayOrigin).toString(),
+      method: "GET",
+      throw: false,
+    });
+    if (health.status !== 200) throw new Error(`OAuth relay health check failed with HTTP ${health.status}`);
     const pending: PendingAuthorization = { verifier, state, relayOrigin, expiresAt: Date.now() + 10 * 60_000 };
-    await this.app.secretStorage.setSecret(PENDING_SECRET_ID, JSON.stringify(pending));
+    this.app.secretStorage.setSecret(PENDING_SECRET_ID, JSON.stringify(pending));
     const challenge = toBase64Url(await sha256(verifier));
-    const url = new URL("/oauth/start", relayOrigin);
-    url.searchParams.set("challenge", challenge);
-    url.searchParams.set("state", state);
-    url.searchParams.set("return_to", "obsidian://vault-relay-auth");
-    if (popup) popup.location.href = url.toString();
-    else window.open(url.toString(), "_blank", "noopener,noreferrer");
+    return buildAuthorizationUrl(relayOrigin, challenge, state);
   }
 
   async complete(ticket: string, state: string): Promise<void> {
@@ -64,8 +64,8 @@ export class GoogleAuth {
     });
     if (response.status !== 200) throw new Error(response.json?.error ?? "Unable to claim Google authorization");
     const credential: StoredCredential = { refreshToken: response.json.refresh_token as string, relayOrigin: pending.relayOrigin };
-    await this.app.secretStorage.setSecret(SECRET_ID, JSON.stringify(credential));
-    await this.app.secretStorage.setSecret(PENDING_SECRET_ID, "");
+    this.app.secretStorage.setSecret(SECRET_ID, JSON.stringify(credential));
+    this.app.secretStorage.setSecret(PENDING_SECRET_ID, "");
     this.accessToken = null;
   }
 
@@ -89,7 +89,7 @@ export class GoogleAuth {
       throw: false,
     });
     if (response.status !== 200) {
-      if (response.status === 401) await this.app.secretStorage.setSecret(SECRET_ID, "");
+      if (response.status === 401) this.app.secretStorage.setSecret(SECRET_ID, "");
       throw new Error(response.json?.error ?? "Google authorization expired");
     }
     this.accessToken = {
@@ -104,8 +104,8 @@ export class GoogleAuth {
   }
 
   async disconnect(): Promise<void> {
-    await this.app.secretStorage.setSecret(SECRET_ID, "");
-    await this.app.secretStorage.setSecret(PENDING_SECRET_ID, "");
+    this.app.secretStorage.setSecret(SECRET_ID, "");
+    this.app.secretStorage.setSecret(PENDING_SECRET_ID, "");
     this.accessToken = null;
   }
 

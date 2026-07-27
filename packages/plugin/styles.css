@@ -24,3 +24,16 @@
   color: var(--text-muted);
   font-size: var(--font-ui-small);
 }
+
+.vault-relay-authorization-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin: var(--size-4-3) 0;
+  padding: var(--size-4-2) var(--size-4-4);
+  border-radius: var(--button-radius);
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  text-decoration: none;
+  font-weight: var(--font-semibold);
+}

@@ -17,8 +17,6 @@ const MIME_TYPES: Record<string, string> = {
 };
 
 export class ObsidianLocalVault implements LocalVault {
-  private readonly suppressed = new Map<string, number>();
-
   constructor(
     private readonly vault: Vault,
     private readonly exclusions: () => string[],
@@ -51,7 +49,6 @@ export class ObsidianLocalVault implements LocalVault {
   async write(path: string, content: ArrayBuffer): Promise<void> {
     const normalized = normalizePath(path);
     await this.ensureParent(normalized);
-    this.suppress(normalized);
     const existing = this.vault.getAbstractFileByPath(normalized);
     if (existing instanceof TFile) await this.vault.modifyBinary(existing, content);
     else if (existing) throw new Error(`Cannot replace folder with file: ${normalized}`);
@@ -63,19 +60,7 @@ export class ObsidianLocalVault implements LocalVault {
     const file = this.vault.getAbstractFileByPath(normalized);
     if (!file) return;
     if (!(file instanceof TFile)) throw new Error(`Cannot remove folder as file: ${normalized}`);
-    this.suppress(normalized);
     await this.vault.trash(file, true);
-  }
-
-  consumeSuppression(path: string): boolean {
-    const expiresAt = this.suppressed.get(path);
-    if (!expiresAt) return false;
-    this.suppressed.delete(path);
-    return expiresAt >= Date.now();
-  }
-
-  private suppress(path: string): void {
-    this.suppressed.set(path, Date.now() + 10_000);
   }
 
   private isExcluded(path: string): boolean {

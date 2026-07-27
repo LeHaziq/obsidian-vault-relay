@@ -1,11 +1,11 @@
 import { createInitialState, DestructiveSyncError, headsForVersions, PROTOCOL_VERSION, sha256, SyncEngine, versionsByPath, type StateRepository, type SyncOperation, type SyncState } from "@vault-relay/protocol";
-import { Notice, Plugin, setIcon, TAbstractFile } from "obsidian";
+import { Notice, Plugin, setIcon } from "obsidian";
 import { GoogleAuth } from "./auth";
 import { GoogleDriveRemote, type RemoteVaultSummary } from "./google-drive";
 import { ObsidianLocalVault } from "./local-vault";
 import { DEFAULT_SETTINGS, type PluginSettings } from "./model";
 import { normalizeRelayOrigin } from "./relay-url";
-import { ConflictModal, RestoreModal, SetupModal, VaultRelaySettingTab } from "./ui";
+import { AuthorizationModal, ConflictModal, RestoreModal, SetupModal, VaultRelaySettingTab } from "./ui";
 
 export default class VaultRelayPlugin extends Plugin {
   settings: PluginSettings = structuredClone(DEFAULT_SETTINGS);
@@ -15,7 +15,6 @@ export default class VaultRelayPlugin extends Plugin {
   private statusDot!: HTMLElement;
   private statusText!: HTMLElement;
   private timer: number | null = null;
-  private debounce: number | null = null;
   private syncing = false;
 
   async onload(): Promise<void> {
@@ -54,14 +53,6 @@ export default class VaultRelayPlugin extends Plugin {
     });
 
     this.registerObsidianProtocolHandler("vault-relay-auth", (params) => void this.handleAuthCallback(params.ticket, params.state));
-    const onFileChanged = (file: TAbstractFile) => {
-      if (!this.local.consumeSuppression(file.path)) this.scheduleSync();
-    };
-    this.registerEvent(this.app.vault.on("create", onFileChanged));
-    this.registerEvent(this.app.vault.on("modify", onFileChanged));
-    this.registerEvent(this.app.vault.on("delete", onFileChanged));
-    this.registerEvent(this.app.vault.on("rename", onFileChanged));
-
     this.resetTimer();
     this.updateStatus();
     this.app.workspace.onLayoutReady(() => {
@@ -71,12 +62,16 @@ export default class VaultRelayPlugin extends Plugin {
 
   onunload(): void {
     if (this.timer !== null) window.clearInterval(this.timer);
-    if (this.debounce !== null) window.clearTimeout(this.debounce);
   }
 
   async connect(): Promise<void> {
-    if (!this.settings.relayUrl) throw new Error("Configure the OAuth relay URL first");
-    await this.auth.begin();
+    try {
+      if (!this.settings.relayUrl) throw new Error("Configure the OAuth relay URL first");
+      const authorizationUrl = await this.auth.prepareAuthorization();
+      new AuthorizationModal(this.app, authorizationUrl).open();
+    } catch (error) {
+      this.reportError(error);
+    }
   }
 
   async updateRelayUrl(value: string): Promise<void> {
@@ -179,7 +174,6 @@ export default class VaultRelayPlugin extends Plugin {
     const remote = new GoogleDriveRemote(this.auth, this.settings.layout, this.settings.maxConcurrentRequests);
     await this.local.write(path, await remote.getBlob(blobHash));
     new Notice(`Restored ${path}; sync to publish it as the current version`);
-    this.scheduleSync();
   }
 
   async resolveConflict(path: string, keepCurrent: boolean): Promise<void> {
@@ -276,12 +270,6 @@ export default class VaultRelayPlugin extends Plugin {
       if (event.key === "Enter" || event.key === " ") open();
     });
     setIcon(this.statusDot, "circle");
-  }
-
-  private scheduleSync(): void {
-    if (this.settings.paused || !this.settings.layout) return;
-    if (this.debounce !== null) window.clearTimeout(this.debounce);
-    this.debounce = window.setTimeout(() => void this.syncNow(false), 2_000);
   }
 
   private async handleAuthCallback(ticket?: string, state?: string): Promise<void> {
