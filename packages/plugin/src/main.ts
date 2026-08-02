@@ -150,10 +150,18 @@ export default class VaultRelayPlugin extends Plugin {
   /** Swapping the remote store resets sync state, so no sync may be in flight. */
   private async rebind(layout: DriveLayout): Promise<void> {
     await this.exclusive(async () => {
+      const current = this.settings.layout;
+      const sameRemote = current !== null
+        && current.vaultId === layout.vaultId
+        && current.rootId === layout.rootId
+        && current.blobsId === layout.blobsId
+        && current.operationsId === layout.operationsId;
       this.settings.layout = layout;
-      this.settings.syncState = createInitialState(this.settings.syncState.deviceId);
-      this.settings.conflicts = [];
-      this.settings.pendingLargeDeletionCount = 0;
+      if (!sameRemote) {
+        this.settings.syncState = createInitialState(this.settings.syncState.deviceId);
+        this.settings.conflicts = [];
+        this.settings.pendingLargeDeletionCount = 0;
+      }
       await this.saveSettings();
     });
   }

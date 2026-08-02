@@ -120,6 +120,37 @@ describe("SyncEngine", () => {
     expect(allDesktopText).toContain("phone edit");
   });
 
+  it("adopts matching remote files when linking with fresh state", async () => {
+    const remote = new MemoryRemote();
+    const source = new MemoryLocal();
+    source.set("note.md", "same content");
+    await device(source, remote, "source").engine.sync();
+
+    const relinked = new MemoryLocal();
+    relinked.set("note.md", "same content");
+    const result = await device(relinked, remote, "relinked").engine.sync();
+
+    expect(result.conflicts).toEqual([]);
+    expect(result.uploadedOperations).toBe(0);
+    expect(remote.operations.size).toBe(1);
+    expect([...relinked.files.keys()]).toEqual(["note.md"]);
+  });
+
+  it("preserves differing local files when linking with fresh state", async () => {
+    const remote = new MemoryRemote();
+    const source = new MemoryLocal();
+    source.set("note.md", "remote content");
+    await device(source, remote, "source").engine.sync();
+
+    const relinked = new MemoryLocal();
+    relinked.set("note.md", "local content");
+    const result = await device(relinked, remote, "relinked").engine.sync();
+
+    expect(result.conflicts).toHaveLength(1);
+    expect(result.uploadedOperations).toBe(1);
+    expect([...relinked.files.values()].map((value) => decoder.decode(value))).toEqual(expect.arrayContaining(["local content", "remote content"]));
+  });
+
   it("commits an operation only after its blob", async () => {
     const remote = new MemoryRemote();
     const local = new MemoryLocal();

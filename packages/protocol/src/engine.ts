@@ -116,16 +116,30 @@ export class SyncEngine {
     const state = await this.states.load();
     for (const operation of Object.values(state.operations)) validateOperation(operation);
     for (const operation of state.pending) validateOperation(operation);
+    const bootstrapping = state.cursor === null
+      && Object.keys(state.operations).length === 0
+      && Object.keys(state.materialized).length === 0
+      && state.pending.length === 0;
+    const knownVersions = versionsByPath(state.operations);
     const localFiles = await this.local.scan();
     assertNoCaseCollisions(localFiles.map((file) => file.path));
     const localByPath = new Map(localFiles.map((file) => [normalizeVaultPath(file.path), file]));
+
+    let pulled: Awaited<ReturnType<RemoteVault["pullOperations"]>> | null = null;
+    if (bootstrapping) {
+      this.checkAborted();
+      pulled = await this.remote.pullOperations(state.cursor);
+      mergePulledOperations(state, pulled.operations);
+      state.cursor = pulled.cursor;
+    }
 
     state.pending = state.pending.filter((operation) => operation.changes.every((mutation) => {
       if (mutation.kind === "delete") return !localByPath.has(mutation.path);
       return localByPath.get(mutation.path)?.hash === mutation.blobHash;
     }));
     const pendingPaths = new Set(state.pending.flatMap((operation) => operation.changes.map((mutation) => mutation.path)));
-    const pending = await this.captureLocalChanges(state, localByPath, pendingPaths);
+    const remoteVersions = bootstrapping ? versionsByPath(state.operations) : null;
+    const pending = await this.captureLocalChanges(state, localByPath, pendingPaths, knownVersions, remoteVersions);
     if (pending.length > 0) {
       state.pending.push(...pending);
       state.nextSequence += pending.length;
@@ -133,14 +147,11 @@ export class SyncEngine {
     }
 
     this.checkAborted();
-    const pulled = await this.remote.pullOperations(state.cursor);
-    for (const operation of pulled.operations) {
-      validateOperation(operation);
-      const existing = state.operations[operation.id];
-      if (existing && !sameOperation(existing, operation)) throw new Error(`Remote operation ID was reused with different content: ${operation.id}`);
-      state.operations[operation.id] = operation;
+    if (!pulled) {
+      pulled = await this.remote.pullOperations(state.cursor);
+      mergePulledOperations(state, pulled.operations);
+      state.cursor = pulled.cursor;
     }
-    state.cursor = pulled.cursor;
 
     // Re-uploading every locally retained operation requires listing the whole
     // remote operations folder, so run it on a schedule instead of every sync.
@@ -180,9 +191,14 @@ export class SyncEngine {
     };
   }
 
-  private async captureLocalChanges(state: SyncState, files: Map<string, LocalFile>, pendingPaths: Set<string>): Promise<SyncOperation[]> {
+  private async captureLocalChanges(
+    state: SyncState,
+    files: Map<string, LocalFile>,
+    pendingPaths: Set<string>,
+    knownVersions: Map<string, Map<string, VersionNode>>,
+    bootstrapVersions: Map<string, Map<string, VersionNode>> | null,
+  ): Promise<SyncOperation[]> {
     const changes: Mutation[] = [];
-    const knownVersions = versionsByPath(state.operations);
     const paths = new Set([...files.keys(), ...Object.keys(state.materialized)]);
 
     for (const path of [...paths].sort()) {
@@ -190,6 +206,11 @@ export class SyncEngine {
       const current = files.get(path);
       const prior = state.materialized[path];
       if (current?.hash === prior?.hash || (!current && !prior)) continue;
+      if (!prior && current && bootstrapVersions) {
+        const alreadyRemote = headsForVersions(bootstrapVersions.get(path) ?? new Map())
+          .some((head) => head.mutation.kind === "put" && head.mutation.blobHash === current.hash);
+        if (alreadyRemote) continue;
+      }
       const parents = headsForVersions(knownVersions.get(path) ?? new Map()).map((head) => head.operation.id);
       if (current) {
         changes.push({
@@ -333,6 +354,15 @@ function sameOperation(left: SyncOperation, right: SyncOperation): boolean {
     if (mutation.kind !== "put" || other.kind !== "put") return true;
     return mutation.blobHash === other.blobHash && mutation.size === other.size && mutation.mimeType === other.mimeType;
   });
+}
+
+function mergePulledOperations(state: SyncState, operations: SyncOperation[]): void {
+  for (const operation of operations) {
+    validateOperation(operation);
+    const existing = state.operations[operation.id];
+    if (existing && !sameOperation(existing, operation)) throw new Error(`Remote operation ID was reused with different content: ${operation.id}`);
+    state.operations[operation.id] = operation;
+  }
 }
 
 export function compactOperations(state: SyncState, retainedVersionsPerPath: number): void {
