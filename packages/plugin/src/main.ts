@@ -232,24 +232,41 @@ export default class VaultRelayPlugin extends Plugin {
   }
 
   async resolveConflict(path: string, keepCurrent: boolean): Promise<void> {
+    await this.resolveConflicts([path], keepCurrent);
+  }
+
+  async resolveAllConflicts(): Promise<void> {
+    await this.resolveConflicts(null);
+  }
+
+  private async resolveConflicts(paths: string[] | null, keepCurrent?: boolean): Promise<void> {
     // A running sync overwrites settings.syncState wholesale when it
     // checkpoints, so mutating it concurrently silently dropped the resolution.
-    await this.exclusive(async () => {
+    const resolved = await this.exclusive(async () => {
       const state = this.settings.syncState;
-      const heads = headsForVersions(versionsByPath(state.operations).get(path) ?? new Map()).map((head) => head.operation.id);
-      if (heads.length < 2) throw new Error("This path no longer has concurrent versions");
-      const sequence = state.nextSequence;
-      let changes: SyncOperation["changes"];
-      if (keepCurrent) {
-        const file = (await this.local.scan()).find((candidate) => candidate.path === path);
-        if (!file) throw new Error("The current file does not exist; choose keep deleted instead");
-        const content = await this.local.read(path);
-        const hash = await sha256(content);
-        changes = [{ kind: "put", path, parents: heads, blobHash: hash, size: content.byteLength, mimeType: file.mimeType }];
-      } else {
-        await this.local.remove(path);
-        changes = [{ kind: "delete", path, parents: heads }];
+      const conflictPaths = [...new Set(paths ?? this.settings.conflicts.map((conflict) => conflict.path))];
+      if (conflictPaths.length === 0) return false;
+      const versions = versionsByPath(state.operations);
+      const files = new Map((await this.local.scan()).map((file) => [file.path, file] as const));
+      const changes: SyncOperation["changes"] = [];
+      for (const path of conflictPaths) {
+        const heads = headsForVersions(versions.get(path) ?? new Map()).map((head) => head.operation.id);
+        if (heads.length < 2) throw new Error(`${path} no longer has concurrent versions`);
+        const file = files.get(path);
+        const keepFile = keepCurrent ?? file !== undefined;
+        if (keepFile) {
+          if (!file) throw new Error("The current file does not exist; choose keep deleted instead");
+          const content = await this.local.read(path);
+          const hash = await sha256(content);
+          changes.push({ kind: "put", path, parents: heads, blobHash: hash, size: content.byteLength, mimeType: file.mimeType });
+        } else {
+          changes.push({ kind: "delete", path, parents: heads });
+        }
       }
+      for (const change of changes) {
+        if (change.kind === "delete") await this.local.remove(change.path);
+      }
+      const sequence = state.nextSequence;
       state.pending.push({
         protocolVersion: PROTOCOL_VERSION,
         id: `${state.deviceId}-${sequence.toString(36)}-${crypto.randomUUID()}`,
@@ -260,8 +277,9 @@ export default class VaultRelayPlugin extends Plugin {
       });
       state.nextSequence += 1;
       await this.saveSettings();
+      return true;
     });
-    await this.syncNow(true);
+    if (resolved) await this.syncNow(true);
   }
 
   async approveLargeDeletion(): Promise<void> {

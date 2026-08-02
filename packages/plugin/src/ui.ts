@@ -260,6 +260,19 @@ export class ConflictModal extends Modal {
       return;
     }
     this.contentEl.createEl("p", { text: "Vault Relay preserved concurrent content as conflict copies. Compare the files, keep the content you want, and delete the extra copy." });
+    new Setting(this.contentEl)
+      .setName("Resolve all conflicts")
+      .setDesc("Keep every file in its current state. Existing files stay; files already deleted remain deleted.")
+      .addButton((button) => button.setButtonText("Keep current state for all").setCta().onClick(async () => {
+        button.setDisabled(true);
+        try {
+          await this.plugin.resolveAllConflicts();
+          this.close();
+        } catch (error) {
+          new Notice(error instanceof Error ? error.message : String(error));
+          button.setDisabled(false);
+        }
+      }));
     for (const conflict of conflicts) {
       const item = this.contentEl.createDiv({ cls: "vault-relay-conflict" });
       item.createEl("strong", { text: conflict.path });
