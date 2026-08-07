@@ -19,12 +19,16 @@ export function conflictPath(path: string, operationId: string): string {
   return `${directory}${filename.slice(0, dot)}.conflict-${suffix}${filename.slice(dot)}`;
 }
 
+// The check normalizes the two sides before it compares them. Thus callers can
+// give raw paths. Only a difference in letter case is a collision. The error
+// message keeps the raw paths, because these are the names in the vault.
 export function assertNoCaseCollisions(paths: string[]): void {
-  const seen = new Map<string, string>();
+  const seen = new Map<string, { normalized: string; raw: string }>();
   for (const path of paths) {
-    const key = normalizeVaultPath(path).toLocaleLowerCase("en-US");
+    const normalized = normalizeVaultPath(path);
+    const key = normalized.toLocaleLowerCase("en-US");
     const previous = seen.get(key);
-    if (previous && previous !== path) throw new Error(`Case-colliding paths: ${previous} and ${path}`);
-    seen.set(key, path);
+    if (previous && previous.normalized !== normalized) throw new Error(`Case-colliding paths: ${previous.raw} and ${path}`);
+    seen.set(key, { normalized, raw: path });
   }
 }

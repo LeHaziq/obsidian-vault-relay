@@ -45,6 +45,14 @@ class MemoryLocal implements LocalVault {
   }
 }
 
+/** A local vault that reports each file twice: once un-normalized, once normalized. */
+class UnnormalizedLocal extends MemoryLocal {
+  async scan(): Promise<LocalFile[]> {
+    const files = await super.scan();
+    return files.flatMap((file) => [{ ...file, path: `/${file.path}` }, file]);
+  }
+}
+
 class MemoryRemote implements RemoteVault {
   blobs = new Map<string, ArrayBuffer>();
   operations = new Map<string, SyncOperation>();
@@ -118,6 +126,19 @@ describe("SyncEngine", () => {
     const allDesktopText = [...desktop.files.values()].map((value) => decoder.decode(value));
     expect(allDesktopText).toContain("desktop edit");
     expect(allDesktopText).toContain("phone edit");
+  });
+
+  it("syncs a local vault that reports un-normalized paths", async () => {
+    const remote = new MemoryRemote();
+    const local = new UnnormalizedLocal();
+    local.set("note.md", "hello");
+    const current = device(local, remote, "device");
+
+    const result = await current.engine.sync();
+
+    const uploadedPaths = [...remote.operations.values()].flatMap((operation) => operation.changes).map((change) => change.path);
+    expect(result.uploadedOperations).toBe(1);
+    expect(uploadedPaths).toEqual(["note.md"]);
   });
 
   it("adopts matching remote files when linking with fresh state", async () => {
