@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { createInitialState, DestructiveSyncError, SyncEngine, validateOperation } from "./engine.js";
+import { createInitialState, DestructiveSyncError, parseSyncState, SyncEngine, validateOperation } from "./engine.js";
 import { sha256 } from "./hash.js";
-import type { LocalFile, LocalVault, RemoteVault, StateRepository, SyncOperation, SyncState } from "./types.js";
+import { PROTOCOL_VERSION, type LocalFile, type LocalVault, type RemoteVault, type StateRepository, type SyncOperation, type SyncState } from "./types.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -381,5 +381,126 @@ describe("SyncEngine", () => {
     await expect(b.engine.sync()).rejects.toBeInstanceOf(DestructiveSyncError);
     await new SyncEngine(destination, remote, b.states, { allowLargeDeletes: true }).sync();
     expect(destination.files.size).toBe(0);
+  });
+});
+
+function operationFor(id: string, path: string, sequence = 1): SyncOperation {
+  return {
+    protocolVersion: PROTOCOL_VERSION,
+    id,
+    deviceId: "desktop",
+    sequence,
+    createdAt: new Date().toISOString(),
+    changes: [{ kind: "put", path, parents: [], blobHash: "a".repeat(64), size: 1, mimeType: "text/markdown" }],
+  };
+}
+
+function persistedState(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    protocolVersion: PROTOCOL_VERSION,
+    deviceId: "desktop",
+    nextSequence: 7,
+    cursor: "token-9",
+    operations: { op: operationFor("op", "a.md") },
+    materialized: { "a.md": { hash: "a".repeat(64), operationId: "op" } },
+    pending: [operationFor("later", "b.md", 6)],
+    lastRepairAt: 1_700_000_000_000,
+    ...overrides,
+  };
+}
+
+describe("parseSyncState", () => {
+  it("returns an initial state for a value that is not an object", () => {
+    for (const value of [null, undefined, "corrupt", 42, []]) {
+      const state = parseSyncState(value);
+      expect(state.protocolVersion).toBe(PROTOCOL_VERSION);
+      expect(state.nextSequence).toBe(1);
+      expect(state.operations).toEqual({});
+      expect(state.deviceId.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("preserves a well-formed state", () => {
+    const source = persistedState();
+    const state = parseSyncState(source);
+    expect(state.deviceId).toBe("desktop");
+    expect(state.nextSequence).toBe(7);
+    expect(state.cursor).toBe("token-9");
+    expect(state.operations).toEqual(source.operations);
+    expect(state.materialized).toEqual(source.materialized);
+    expect(state.pending).toEqual(source.pending);
+    expect(state.lastRepairAt).toBe(1_700_000_000_000);
+  });
+
+  it("discards a state from a different protocol version", () => {
+    const state = parseSyncState(persistedState({ protocolVersion: 99 }));
+    expect(state.protocolVersion).toBe(PROTOCOL_VERSION);
+    expect(state.operations).toEqual({});
+    expect(state.cursor).toBeNull();
+  });
+
+  it("keeps the device identity when the rest is unusable", () => {
+    const state = parseSyncState({ protocolVersion: 1, deviceId: "phone-1", operations: "nope" });
+    expect(state.deviceId).toBe("phone-1");
+    expect(state.operations).toEqual({});
+    expect(state.nextSequence).toBe(1);
+  });
+
+  it("invents a device identity when the persisted one is unusable", () => {
+    for (const deviceId of ["", 42, "x".repeat(201)]) {
+      expect(parseSyncState(persistedState({ deviceId })).deviceId.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("discards a state that holds a malformed operation", () => {
+    const truncated = { ...operationFor("op", "a.md"), changes: undefined };
+    for (const operations of [{ op: truncated }, { op: {} }, { op: null }, { other: operationFor("op", "a.md") }]) {
+      expect(parseSyncState(persistedState({ operations })).operations).toEqual({});
+    }
+  });
+
+  it("discards a state whose pending work is malformed", () => {
+    for (const pending of [[{}], [operationFor("op", "../outside")], "not an array"]) {
+      expect(parseSyncState(persistedState({ pending })).pending).toEqual([]);
+    }
+  });
+
+  it("discards a state whose materialized files are malformed", () => {
+    const bad = [
+      { "a.md": { hash: "short", operationId: "op" } },
+      { "a.md": { hash: "a".repeat(64) } },
+      { "../outside": { hash: "a".repeat(64), operationId: "op" } },
+      { "a.md": "junk" },
+    ];
+    for (const materialized of bad) {
+      expect(parseSyncState(persistedState({ materialized })).materialized).toEqual({});
+    }
+  });
+
+  it("never rewinds the sequence counter behind the retained work", () => {
+    // A repeated sequence number makes two different operations of one device.
+    for (const nextSequence of ["abc", 0, Number.NaN, 2.5, 3]) {
+      expect(parseSyncState(persistedState({ nextSequence })).nextSequence).toBe(7);
+    }
+    expect(parseSyncState(persistedState({ nextSequence: 12 })).nextSequence).toBe(12);
+    expect(parseSyncState({ protocolVersion: PROTOCOL_VERSION, deviceId: "desktop", operations: {}, materialized: {}, pending: [], nextSequence: "abc" }).nextSequence).toBe(1);
+  });
+
+  it("drops a repair time that is not a number", () => {
+    expect(parseSyncState(persistedState({ lastRepairAt: "soon" })).lastRepairAt).toBeNull();
+  });
+
+  it("drops a cursor that is not a plausible page token", () => {
+    expect(parseSyncState(persistedState({ cursor: 5 })).cursor).toBeNull();
+    expect(parseSyncState(persistedState({ cursor: "x".repeat(4_001) })).cursor).toBeNull();
+  });
+
+  it("gives the engine a state it accepts", async () => {
+    const remote = new MemoryRemote();
+    const local = new MemoryLocal();
+    local.set("note.md", "body");
+    const states = new MemoryState(parseSyncState("corrupt"));
+    await new SyncEngine(local, remote, states).sync();
+    expect(remote.operations.size).toBe(1);
   });
 });

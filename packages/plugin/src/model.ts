@@ -1,4 +1,4 @@
-import { createInitialState, PROTOCOL_VERSION, type Conflict, type SyncState } from "@vault-relay/protocol";
+import { createInitialState, parseSyncState, type Conflict, type SyncState } from "@vault-relay/protocol";
 import { safeRelayOrigin } from "./relay-url";
 
 export interface DriveLayout {
@@ -79,32 +79,6 @@ function conflicts(value: unknown): Conflict[] {
   });
 }
 
-/**
- * A hand-edited or truncated data.json previously flowed straight into the
- * plugin: a non-numeric interval became NaN and setInterval then fired
- * continuously. Everything persisted is treated as untrusted here.
- */
-function syncState(value: unknown): SyncState {
-  if (!isRecord(value)) return createInitialState();
-  const deviceId = typeof value.deviceId === "string" && value.deviceId.length > 0 && value.deviceId.length <= 200 ? value.deviceId : undefined;
-  const fresh = createInitialState(deviceId);
-  if (value.protocolVersion !== PROTOCOL_VERSION) return fresh;
-  if (!isRecord(value.operations) || !isRecord(value.materialized) || !Array.isArray(value.pending)) return fresh;
-  const nextSequence = integer(value.nextSequence, 1, 1, Number.MAX_SAFE_INTEGER);
-  const lastRepairAt = typeof value.lastRepairAt === "number" && Number.isFinite(value.lastRepairAt) ? value.lastRepairAt : null;
-  return {
-    protocolVersion: PROTOCOL_VERSION,
-    deviceId: fresh.deviceId,
-    nextSequence,
-    cursor: text(value.cursor, null, 4_000),
-    // Operation and mutation shapes are validated by the engine on every sync.
-    operations: value.operations as SyncState["operations"],
-    materialized: value.materialized as SyncState["materialized"],
-    pending: value.pending as SyncState["pending"],
-    lastRepairAt,
-  };
-}
-
 export function sanitizeSettings(loaded: unknown): PluginSettings {
   const source = isRecord(loaded) ? loaded : {};
   const relayUrl = typeof source.relayUrl === "string" ? safeRelayOrigin(source.relayUrl) : null;
@@ -122,7 +96,9 @@ export function sanitizeSettings(loaded: unknown): PluginSettings {
     maxConcurrentRequests: integer(source.maxConcurrentRequests, DEFAULT_SETTINGS.maxConcurrentRequests, MIN_CONCURRENCY, MAX_CONCURRENCY),
     exclusions,
     layout: resolvedLayout,
-    syncState: syncState(source.syncState),
+    // The protocol gives the rule for a valid sync state. All persisted data is
+    // untrusted. A state that the protocol rejects becomes an initial state.
+    syncState: parseSyncState(source.syncState),
     lastSyncAt: text(source.lastSyncAt, null, 64),
     lastError: text(source.lastError, null),
     conflicts: conflicts(source.conflicts),

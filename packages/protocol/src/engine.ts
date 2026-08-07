@@ -1,13 +1,18 @@
 import { assertNoCaseCollisions, conflictPath, normalizeVaultPath } from "./path.js";
 import { headsForPath, headsForVersions, versionsByPath, type VersionNode } from "./graph.js";
 import { sha256 } from "./hash.js";
-import { PROTOCOL_VERSION, type Conflict, type LocalFile, type LocalVault, type Mutation, type RemoteVault, type StateRepository, type SyncEngineOptions, type SyncOperation, type SyncResult, type SyncState } from "./types.js";
+import { PROTOCOL_VERSION, type Conflict, type LocalFile, type LocalVault, type MaterializedFile, type Mutation, type RemoteVault, type StateRepository, type SyncEngineOptions, type SyncOperation, type SyncResult, type SyncState } from "./types.js";
 
 export const MAX_CHANGES_PER_OPERATION = 1_000;
 const DEFAULT_REPAIR_INTERVAL_MS = 6 * 60 * 60_000;
 const DEFAULT_CHECKPOINT_FILES = 50;
 const DEFAULT_CHECKPOINT_MS = 2_000;
 const MIME_TYPE_PATTERN = /^[A-Za-z0-9][\w.+-]*\/[A-Za-z0-9][\w.+-]*$/;
+const BLOB_HASH_PATTERN = /^[a-f0-9]{64}$/;
+const MAX_ID_LENGTH = 300;
+const MAX_DEVICE_ID_LENGTH = 200;
+const MAX_CURSOR_LENGTH = 4_000;
+const MAX_PATH_LENGTH = 4_096;
 
 export class DestructiveSyncError extends Error {
   constructor(public readonly count: number) {
@@ -16,37 +21,51 @@ export class DestructiveSyncError extends Error {
   }
 }
 
-export function validateOperation(value: SyncOperation): SyncOperation {
-  if (!value || value.protocolVersion !== PROTOCOL_VERSION || typeof value.id !== "string" || value.id.length < 1 || value.id.length > 300) {
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isOperationId(value: unknown): value is string {
+  return typeof value === "string" && value.length >= 1 && value.length <= MAX_ID_LENGTH;
+}
+
+export function validateOperation(value: unknown): SyncOperation {
+  if (!isRecord(value) || value.protocolVersion !== PROTOCOL_VERSION || !isOperationId(value.id)) {
     throw new Error("Remote operation has an unsupported or invalid format");
   }
-  if (typeof value.deviceId !== "string" || value.deviceId.length > 200 || !Number.isSafeInteger(value.sequence) || value.sequence < 1) {
-    throw new Error(`Remote operation has invalid device metadata: ${value.id}`);
+  const id = value.id;
+  if (typeof value.deviceId !== "string" || value.deviceId.length > MAX_DEVICE_ID_LENGTH || typeof value.sequence !== "number" || !Number.isSafeInteger(value.sequence) || value.sequence < 1) {
+    throw new Error(`Remote operation has invalid device metadata: ${id}`);
   }
   if (typeof value.createdAt !== "string" || !Number.isFinite(Date.parse(value.createdAt)) || !Array.isArray(value.changes) || value.changes.length > 10_000) {
-    throw new Error(`Remote operation has invalid change metadata: ${value.id}`);
+    throw new Error(`Remote operation has invalid change metadata: ${id}`);
   }
+  const changes: unknown[] = value.changes;
   const seen = new Set<string>();
-  for (const mutation of value.changes) {
-    if (!mutation || (mutation.kind !== "put" && mutation.kind !== "delete") || typeof mutation.path !== "string" || mutation.path.length > 4096) {
-      throw new Error(`Remote operation contains an invalid mutation: ${value.id}`);
+  for (const mutation of changes) {
+    if (!isRecord(mutation) || (mutation.kind !== "put" && mutation.kind !== "delete") || typeof mutation.path !== "string" || mutation.path.length > MAX_PATH_LENGTH) {
+      throw new Error(`Remote operation contains an invalid mutation: ${id}`);
     }
     const normalized = normalizeVaultPath(mutation.path);
-    if (normalized !== mutation.path || seen.has(normalized)) throw new Error(`Remote operation contains an invalid or duplicate path: ${value.id}`);
+    if (normalized !== mutation.path || seen.has(normalized)) throw new Error(`Remote operation contains an invalid or duplicate path: ${id}`);
     seen.add(normalized);
-    if (!Array.isArray(mutation.parents) || new Set(mutation.parents).size !== mutation.parents.length || mutation.parents.includes(value.id) || mutation.parents.some((parent) => typeof parent !== "string" || parent.length < 1 || parent.length > 300)) {
-      throw new Error(`Remote operation contains invalid parents: ${value.id}`);
+    if (!Array.isArray(mutation.parents)) throw new Error(`Remote operation contains invalid parents: ${id}`);
+    const parents: unknown[] = mutation.parents;
+    if (new Set(parents).size !== parents.length || parents.includes(id) || parents.some((parent) => !isOperationId(parent))) {
+      throw new Error(`Remote operation contains invalid parents: ${id}`);
     }
-    if (mutation.kind === "put" && (!/^[a-f0-9]{64}$/.test(mutation.blobHash) || !Number.isSafeInteger(mutation.size) || mutation.size < 0)) {
-      throw new Error(`Remote operation contains invalid content metadata: ${value.id}`);
+    if (mutation.kind === "put" && (typeof mutation.blobHash !== "string" || !BLOB_HASH_PATTERN.test(mutation.blobHash) || typeof mutation.size !== "number" || !Number.isSafeInteger(mutation.size) || mutation.size < 0)) {
+      throw new Error(`Remote operation contains invalid content metadata: ${id}`);
     }
     // The MIME type is interpolated into multipart upload headers, so reject
     // anything that is not a plain type/subtype token.
     if (mutation.kind === "put" && (typeof mutation.mimeType !== "string" || mutation.mimeType.length > 255 || !MIME_TYPE_PATTERN.test(mutation.mimeType))) {
-      throw new Error(`Remote operation contains an invalid MIME type: ${value.id}`);
+      throw new Error(`Remote operation contains an invalid MIME type: ${id}`);
     }
   }
-  return value;
+  // The checks above cover each field of the type. Thus the value now has the
+  // shape that the other functions of the module use.
+  return value as unknown as SyncOperation;
 }
 
 export function createInitialState(deviceId: string = crypto.randomUUID()): SyncState {
@@ -60,6 +79,95 @@ export function createInitialState(deviceId: string = crypto.randomUUID()): Sync
     pending: [],
     lastRepairAt: null,
   };
+}
+
+/**
+ * Makes a sync state from a persisted value. All data on disk is untrusted. A
+ * hand-edited or truncated file must not go to the engine. The engine throws if
+ * an operation is malformed. Thus a state that does not parse fully becomes an
+ * initial state. This costs one bootstrap from the remote store. Only the device
+ * identity stays, because the sequence numbers of the device continue from it.
+ */
+export function parseSyncState(value: unknown): SyncState {
+  if (!isRecord(value)) return createInitialState();
+  const deviceId = typeof value.deviceId === "string" && value.deviceId.length >= 1 && value.deviceId.length <= MAX_DEVICE_ID_LENGTH ? value.deviceId : undefined;
+  const fresh = createInitialState(deviceId);
+  if (value.protocolVersion !== PROTOCOL_VERSION) return fresh;
+  const operations = parseOperations(value.operations);
+  const materialized = parseMaterialized(value.materialized);
+  const pending = parsePending(value.pending);
+  if (!operations || !materialized || !pending) return fresh;
+  const persisted = typeof value.nextSequence === "number" && Number.isSafeInteger(value.nextSequence) && value.nextSequence >= 1 ? value.nextSequence : 1;
+  return {
+    protocolVersion: PROTOCOL_VERSION,
+    deviceId: fresh.deviceId,
+    // A rewound counter makes the device use a sequence number a second time.
+    // Thus the retained work sets the floor when the persisted counter is bad.
+    nextSequence: Math.max(persisted, nextFreeSequence(fresh.deviceId, [...Object.values(operations), ...pending])),
+    cursor: typeof value.cursor === "string" && value.cursor.length <= MAX_CURSOR_LENGTH ? value.cursor : null,
+    operations,
+    materialized,
+    pending,
+    lastRepairAt: typeof value.lastRepairAt === "number" && Number.isFinite(value.lastRepairAt) ? value.lastRepairAt : null,
+  };
+}
+
+function nextFreeSequence(deviceId: string, operations: SyncOperation[]): number {
+  let highest = 0;
+  for (const operation of operations) {
+    if (operation.deviceId === deviceId && operation.sequence > highest) highest = operation.sequence;
+  }
+  return highest + 1;
+}
+
+/** Each key of the map is the id of its operation. A different key is corrupt. */
+function parseOperations(value: unknown): Record<string, SyncOperation> | null {
+  if (!isRecord(value)) return null;
+  const operations: Record<string, SyncOperation> = {};
+  for (const [id, entry] of Object.entries(value)) {
+    const operation = parseOperation(entry);
+    if (!operation || operation.id !== id) return null;
+    operations[id] = operation;
+  }
+  return operations;
+}
+
+function parsePending(value: unknown): SyncOperation[] | null {
+  if (!Array.isArray(value)) return null;
+  const pending: SyncOperation[] = [];
+  for (const entry of value as unknown[]) {
+    const operation = parseOperation(entry);
+    if (!operation) return null;
+    pending.push(operation);
+  }
+  return pending;
+}
+
+function parseOperation(value: unknown): SyncOperation | null {
+  try {
+    return validateOperation(value);
+  } catch {
+    return null;
+  }
+}
+
+function parseMaterialized(value: unknown): Record<string, MaterializedFile> | null {
+  if (!isRecord(value)) return null;
+  const materialized: Record<string, MaterializedFile> = {};
+  for (const [path, entry] of Object.entries(value)) {
+    if (!isRecord(entry) || typeof entry.hash !== "string" || !BLOB_HASH_PATTERN.test(entry.hash) || !isOperationId(entry.operationId)) return null;
+    if (path.length > MAX_PATH_LENGTH || safeVaultPath(path) !== path) return null;
+    materialized[path] = { hash: entry.hash, operationId: entry.operationId };
+  }
+  return materialized;
+}
+
+function safeVaultPath(path: string): string | null {
+  try {
+    return normalizeVaultPath(path);
+  } catch {
+    return null;
+  }
 }
 
 /**

@@ -1,4 +1,4 @@
-import { PROTOCOL_VERSION } from "@vault-relay/protocol";
+import { parseSyncState, PROTOCOL_VERSION } from "@vault-relay/protocol";
 import { describe, expect, it } from "vitest";
 import { DEFAULT_SETTINGS, MAX_CONCURRENCY, sanitizeSettings } from "./model";
 
@@ -41,35 +41,16 @@ describe("sanitizeSettings", () => {
     expect(sanitizeSettings({ layout: complete }).layout).toEqual(complete);
   });
 
-  it("replaces a structurally invalid sync state but keeps the device identity", () => {
-    const fresh = sanitizeSettings({ syncState: { protocolVersion: PROTOCOL_VERSION, deviceId: "phone-1", operations: "nope" } });
-    expect(fresh.syncState.deviceId).toBe("phone-1");
-    expect(fresh.syncState.operations).toEqual({});
-    expect(fresh.syncState.nextSequence).toBe(1);
-  });
-
-  it("discards a sync state from a different protocol version", () => {
-    const state = sanitizeSettings({ syncState: { protocolVersion: 99, deviceId: "d", operations: { a: {} }, materialized: {}, pending: [] } }).syncState;
-    expect(state.protocolVersion).toBe(PROTOCOL_VERSION);
-    expect(state.operations).toEqual({});
-  });
-
-  it("preserves a well-formed sync state", () => {
-    const source = {
-      protocolVersion: PROTOCOL_VERSION,
-      deviceId: "desktop",
-      nextSequence: 7,
-      cursor: "token-9",
-      operations: {},
-      materialized: { "a.md": { hash: "f".repeat(64), operationId: "op" } },
-      pending: [],
-      lastRepairAt: 1_700_000_000_000,
-    };
-    const state = sanitizeSettings({ syncState: source }).syncState;
-    expect(state.nextSequence).toBe(7);
-    expect(state.cursor).toBe("token-9");
-    expect(state.materialized).toEqual(source.materialized);
-    expect(state.lastRepairAt).toBe(1_700_000_000_000);
+  it("delegates sync-state parsing to the protocol", () => {
+    // The protocol owns the shape rules; this only proves the settings reach it.
+    const corrupt = sanitizeSettings({ syncState: { protocolVersion: PROTOCOL_VERSION, deviceId: "phone-1", operations: "nope" } }).syncState;
+    expect(corrupt.deviceId).toBe("phone-1");
+    expect(corrupt.operations).toEqual({});
+    // The device identity is a new random id each time, thus compare the rest.
+    const { deviceId, ...absent } = sanitizeSettings({}).syncState;
+    const { deviceId: fresh, ...initial } = parseSyncState(undefined);
+    expect(absent).toEqual(initial);
+    expect(deviceId).not.toBe(fresh);
   });
 
   it("filters exclusion entries and trims whitespace", () => {
