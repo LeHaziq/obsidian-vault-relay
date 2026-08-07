@@ -1,21 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import type { Config } from "./config.js";
+import { baseConfig } from "./config.test-helper.js";
 import { createRelay, type Relay } from "./relay.js";
-
-const KEY = "test-encryption-key-of-sufficient-length";
-
-function baseConfig(overrides: Partial<Config> = {}): Config {
-  return {
-    port: 0,
-    publicUrl: "https://auth.example.com",
-    googleClientId: "client-id.apps.googleusercontent.com",
-    googleClientSecret: "client-secret",
-    encryptionKey: KEY,
-    databasePath: ":memory:",
-    trustProxy: false,
-    ...overrides,
-  };
-}
 
 const running: Relay[] = [];
 
@@ -30,6 +16,16 @@ afterEach(async () => {
   await Promise.all(running.splice(0).map((relay) => relay.close()));
 });
 
+/** The store answers only while its database is open, so this reports whether it is. */
+function storeUsable(relay: Relay): boolean {
+  try {
+    relay.store.createAuthRequest("challenge", "state", "obsidian://vault-relay-auth");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 describe("createRelay", () => {
   it("serves requests on the port it listens on", async () => {
     const { base } = await start();
@@ -38,12 +34,28 @@ describe("createRelay", () => {
     expect(await response.json()).toEqual({ status: "ok" });
   });
 
-  it("closes the server and the store, and tolerates a second close", async () => {
-    const { relay, base } = await start();
+  it("disposes the app, then closes the server and the store, and tolerates a second close", async () => {
+    let disposals = 0;
+    let storeOpenAtDisposal = false;
+    const relay: Relay = createRelay(baseConfig(), {
+      handler: {
+        handle: async () => {},
+        dispose: () => {
+          disposals += 1;
+          storeOpenAtDisposal = storeUsable(relay);
+        },
+      },
+    });
+    running.push(relay);
+    const base = `http://127.0.0.1:${await relay.listen(0, "127.0.0.1")}`;
+
     await relay.close();
     await relay.close();
+
+    expect(disposals).toBe(1);
+    expect(storeOpenAtDisposal).toBe(true);
     await expect(fetch(`${base}/health`)).rejects.toThrow();
-    expect(() => relay.store.createAuthRequest("challenge", "state", "obsidian://vault-relay-auth")).toThrow();
+    expect(storeUsable(relay)).toBe(false);
   });
 
   it("fails one request with a 500 when request handling throws unexpectedly", async () => {

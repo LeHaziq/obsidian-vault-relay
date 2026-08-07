@@ -2,7 +2,8 @@ import { loadConfig } from "./config.js";
 import { createRelay } from "./relay.js";
 
 const config = loadConfig();
-const relay = createRelay(config);
+// A server that can no longer accept connections is not worth staying up for.
+const relay = createRelay(config, { onError: () => void shutdown(1) });
 
 process.on("unhandledRejection", (reason) => {
   console.error(JSON.stringify({ message: "Unhandled rejection", error: reason instanceof Error ? reason.message : String(reason) }));
@@ -23,7 +24,7 @@ async function shutdown(code: number): Promise<void> {
 }
 
 try {
-  await relay.listen(config.port);
+  await relay.listen();
   console.info(`Vault Relay OAuth service listening on port ${config.port}`);
 } catch {
   // createRelay already logged the failure on the server's error event.

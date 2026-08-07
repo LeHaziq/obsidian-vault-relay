@@ -2,26 +2,13 @@ import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 import { normalizeAddress } from "./app.js";
 import type { Config } from "./config.js";
+import { baseConfig } from "./config.test-helper.js";
 import { clientChallenge } from "./pkce.test-helper.js";
 import { createRelay } from "./relay.js";
 import type { GrantStore } from "./store.js";
 
-const KEY = "test-encryption-key-of-sufficient-length";
 const RETURN_TO = "obsidian://vault-relay-auth";
 const VERIFIER = "v".repeat(48);
-
-function baseConfig(overrides: Partial<Config> = {}): Config {
-  return {
-    port: 0,
-    publicUrl: "https://auth.example.com",
-    googleClientId: "client-id.apps.googleusercontent.com",
-    googleClientSecret: "client-secret",
-    encryptionKey: KEY,
-    databasePath: ":memory:",
-    trustProxy: false,
-    ...overrides,
-  };
-}
 
 function jsonFetch(payload: unknown, status = 200): typeof fetch {
   return (async () => new Response(JSON.stringify(payload), { status, headers: { "Content-Type": "application/json" } })) as unknown as typeof fetch;
