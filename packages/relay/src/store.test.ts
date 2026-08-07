@@ -1,13 +1,13 @@
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
-import { verifierChallenge } from "./crypto.js";
+import { clientChallenge } from "./pkce.test-helper.js";
 import { GrantStore } from "./store.js";
 
 describe("GrantStore", () => {
   it("binds a one-time grant to its verifier", () => {
     const store = new GrantStore(new DatabaseSync(":memory:"), "test-encryption-key-of-sufficient-length");
     const verifier = "v".repeat(48);
-    const ticket = store.createGrant(verifierChallenge(verifier), "refresh-secret");
+    const ticket = store.createGrant(clientChallenge(verifier), "refresh-secret");
     expect(store.claim(ticket, "wrong")).toBeNull();
     expect(store.claim(ticket, verifier)).toBe("refresh-secret");
     expect(store.claim(ticket, verifier)).toBeNull();

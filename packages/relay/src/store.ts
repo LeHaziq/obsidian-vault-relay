@@ -1,6 +1,7 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
-import { base64Url, digest, newKeySalt, safeEqual, TokenCipher, verifierChallenge } from "./crypto.js";
+import { TokenCipher } from "./crypto.js";
+import { verifierMatchesChallenge } from "./pkce.js";
 
 interface AuthRow {
   nonce: string;
@@ -50,7 +51,7 @@ export class GrantStore {
 
   createAuthRequest(challenge: string, userState: string, returnTo: string, now = Date.now()): string {
     this.cleanup(now);
-    const nonce = base64Url(randomBytes(32));
+    const nonce = randomSecret();
     this.db.prepare("INSERT INTO auth_requests(nonce, challenge, user_state, return_to, expires_at) VALUES (?, ?, ?, ?, ?)")
       .run(nonce, challenge, userState, returnTo, now + 10 * 60_000);
     return nonce;
@@ -66,19 +67,19 @@ export class GrantStore {
   }
 
   createGrant(challenge: string, refreshToken: string, now = Date.now()): string {
-    const ticket = base64Url(randomBytes(32));
+    const ticket = randomSecret();
     this.db.prepare("INSERT INTO grants(ticket_hash, challenge, encrypted_token, expires_at) VALUES (?, ?, ?, ?)")
-      .run(digest(ticket), challenge, this.cipher.encrypt(refreshToken), now + 5 * 60_000);
+      .run(ticketHash(ticket), challenge, this.cipher.encrypt(refreshToken), now + 5 * 60_000);
     return ticket;
   }
 
   claim(ticket: string, verifier: string, now = Date.now()): string | null {
     const encrypted = this.transaction(() => {
-      const ticketHash = digest(ticket);
+      const hash = ticketHash(ticket);
       const row = this.db.prepare("SELECT ticket_hash, challenge, encrypted_token, expires_at FROM grants WHERE ticket_hash = ?")
-        .get(ticketHash) as GrantRow | undefined;
-      if (!row || row.expires_at < now || !safeEqual(row.challenge, verifierChallenge(verifier))) return null;
-      this.db.prepare("DELETE FROM grants WHERE ticket_hash = ?").run(ticketHash);
+        .get(hash) as GrantRow | undefined;
+      if (!row || row.expires_at < now || !verifierMatchesChallenge(verifier, row.challenge)) return null;
+      this.db.prepare("DELETE FROM grants WHERE ticket_hash = ?").run(hash);
       return row.encrypted_token;
     });
     return encrypted === null ? null : this.cipher.decrypt(encrypted);
@@ -109,7 +110,7 @@ export class GrantStore {
     return this.transaction(() => {
       const row = this.db.prepare("SELECT value FROM relay_meta WHERE key = ?").get(SALT_KEY) as { value: string } | undefined;
       if (row) return Buffer.from(row.value, "base64");
-      const salt = newKeySalt();
+      const salt = TokenCipher.newSalt();
       this.db.prepare("INSERT INTO relay_meta(key, value) VALUES (?, ?)").run(SALT_KEY, salt.toString("base64"));
       return salt;
     });
@@ -119,4 +120,19 @@ export class GrantStore {
     this.db.prepare("DELETE FROM auth_requests WHERE expires_at < ?").run(now);
     this.db.prepare("DELETE FROM grants WHERE expires_at < ?").run(now);
   }
+}
+
+/** 256 bits of entropy, URL-safe: the shape of both nonces and tickets. */
+function randomSecret(): string {
+  return randomBytes(32).toString("base64url");
+}
+
+/**
+ * The store keeps only the hash of each ticket. Thus a stolen database file
+ * gives no ticket that a thief can still redeem. A plain digest is sufficient
+ * here, although a password would need scrypt. The ticket is 256 random bits,
+ * not a secret that an attacker can guess.
+ */
+function ticketHash(ticket: string): string {
+  return createHash("sha256").update(ticket).digest("hex");
 }

@@ -1,34 +1,17 @@
-import { createCipheriv, createDecipheriv, createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
+import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from "node:crypto";
 
 /** Minimum accepted length of TOKEN_ENCRYPTION_KEY, in characters. */
 export const MIN_ENCRYPTION_KEY_LENGTH = 32;
 /** Salt length used for key derivation, in bytes. */
 export const KEY_SALT_BYTES = 16;
 
-export function base64Url(input: Buffer): string {
-  return input.toString("base64url");
-}
-
-export function digest(input: string): string {
-  return createHash("sha256").update(input).digest("hex");
-}
-
-export function verifierChallenge(verifier: string): string {
-  return createHash("sha256").update(verifier).digest("base64url");
-}
-
-export function safeEqual(left: string, right: string): boolean {
-  const a = Buffer.from(left);
-  const b = Buffer.from(right);
-  return a.length === b.length && timingSafeEqual(a, b);
-}
-
-export function newKeySalt(): Buffer {
-  return randomBytes(KEY_SALT_BYTES);
-}
-
 export class TokenCipher {
   private readonly key: Buffer;
+
+  /** A salt for a cipher that has none yet. Persist it with the ciphertext. */
+  static newSalt(): Buffer {
+    return randomBytes(KEY_SALT_BYTES);
+  }
 
   /**
    * Derives the AES key with scrypt rather than a bare hash, so a weak operator
@@ -49,7 +32,7 @@ export class TokenCipher {
     const nonce = randomBytes(12);
     const cipher = createCipheriv("aes-256-gcm", this.key, nonce);
     const ciphertext = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
-    return [base64Url(nonce), base64Url(cipher.getAuthTag()), base64Url(ciphertext)].join(".");
+    return [nonce, cipher.getAuthTag(), ciphertext].map((part) => part.toString("base64url")).join(".");
   }
 
   decrypt(value: string): string {

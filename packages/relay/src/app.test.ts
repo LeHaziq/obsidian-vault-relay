@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 import { normalizeAddress, RelayApp } from "./app.js";
 import type { Config } from "./config.js";
-import { verifierChallenge } from "./crypto.js";
+import { clientChallenge } from "./pkce.test-helper.js";
 import { GrantStore } from "./store.js";
 
 const KEY = "test-encryption-key-of-sufficient-length";
@@ -71,7 +71,7 @@ afterEach(async () => {
 
 function startUrl(base: string, overrides: Record<string, string> = {}): string {
   const url = new URL("/oauth/start", base);
-  url.searchParams.set("challenge", verifierChallenge(VERIFIER));
+  url.searchParams.set("challenge", clientChallenge(VERIFIER));
   url.searchParams.set("state", randomUUID());
   url.searchParams.set("return_to", RETURN_TO);
   for (const [key, value] of Object.entries(overrides)) url.searchParams.set(key, value);
