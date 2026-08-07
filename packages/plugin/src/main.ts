@@ -1,4 +1,4 @@
-import { createInitialState, DestructiveSyncError, headsForPath, PROTOCOL_VERSION, sha256, SyncEngine, versionsByPath, type StateRepository, type SyncOperation, type SyncState } from "@vault-relay/protocol";
+import { appendChanges, createInitialState, DestructiveSyncError, headsForPath, sha256, SyncEngine, versionsByPath, type Mutation, type StateRepository, type SyncState } from "@vault-relay/protocol";
 import { Plugin, setIcon } from "obsidian";
 import { GoogleAuth } from "./auth";
 import { GoogleDriveRemote, type RemoteVaultSummary } from "./google-drive";
@@ -263,7 +263,7 @@ export default class VaultRelayPlugin extends Plugin {
       if (conflictPaths.length === 0) return false;
       const versions = versionsByPath(state.operations);
       const files = new Map((await this.local.scan()).map((file) => [file.path, file] as const));
-      const changes: SyncOperation["changes"] = [];
+      const changes: Mutation[] = [];
       for (const path of conflictPaths) {
         const heads = headsForPath(versions, path).map((head) => head.operation.id);
         if (heads.length < 2) throw new Error(`${path} no longer has concurrent versions`);
@@ -281,16 +281,7 @@ export default class VaultRelayPlugin extends Plugin {
       for (const change of changes) {
         if (change.kind === "delete") await this.local.remove(change.path);
       }
-      const sequence = state.nextSequence;
-      state.pending.push({
-        protocolVersion: PROTOCOL_VERSION,
-        id: `${state.deviceId}-${sequence.toString(36)}-${crypto.randomUUID()}`,
-        deviceId: state.deviceId,
-        sequence,
-        createdAt: new Date().toISOString(),
-        changes,
-      });
-      state.nextSequence += 1;
+      appendChanges(state, changes);
       await this.saveSettings();
       return true;
     });

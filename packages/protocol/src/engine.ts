@@ -82,6 +82,27 @@ export function createInitialState(deviceId: string = crypto.randomUUID()): Sync
 }
 
 /**
+ * Appends changes to a sync state as a new pending operation. This is the only
+ * place that mints an operation id and consumes the next sequence number, so
+ * every source of pending work (local capture, conflict resolution) shares the
+ * rule. Returns the appended operation.
+ */
+export function appendChanges(state: SyncState, changes: Mutation[]): SyncOperation {
+  const sequence = state.nextSequence;
+  const operation: SyncOperation = {
+    protocolVersion: PROTOCOL_VERSION,
+    id: `${state.deviceId}-${sequence.toString(36)}-${crypto.randomUUID()}`,
+    deviceId: state.deviceId,
+    sequence,
+    createdAt: new Date().toISOString(),
+    changes,
+  };
+  state.pending.push(operation);
+  state.nextSequence += 1;
+  return operation;
+}
+
+/**
  * Makes a sync state from a persisted value. All data on disk is untrusted. A
  * hand-edited or truncated file must not go to the engine. The engine throws if
  * an operation is malformed. Thus a state that does not parse fully becomes an
@@ -249,8 +270,9 @@ export class SyncEngine {
     const remoteVersions = bootstrapping ? versionsByPath(state.operations) : null;
     const pending = await this.captureLocalChanges(state, localByPath, pendingPaths, knownVersions, remoteVersions);
     if (pending.length > 0) {
-      state.pending.push(...pending);
-      state.nextSequence += pending.length;
+      for (let offset = 0; offset < pending.length; offset += MAX_CHANGES_PER_OPERATION) {
+        appendChanges(state, pending.slice(offset, offset + MAX_CHANGES_PER_OPERATION));
+      }
       await this.states.save(state);
     }
 
@@ -305,7 +327,7 @@ export class SyncEngine {
     pendingPaths: Set<string>,
     knownVersions: Map<string, Map<string, VersionNode>>,
     bootstrapVersions: Map<string, Map<string, VersionNode>> | null,
-  ): Promise<SyncOperation[]> {
+  ): Promise<Mutation[]> {
     const changes: Mutation[] = [];
     const paths = new Set([...files.keys(), ...Object.keys(state.materialized)]);
 
@@ -333,20 +355,7 @@ export class SyncEngine {
         changes.push({ kind: "delete", path, parents });
       }
     }
-
-    const operations: SyncOperation[] = [];
-    for (let offset = 0; offset < changes.length; offset += MAX_CHANGES_PER_OPERATION) {
-      const sequence = state.nextSequence + operations.length;
-      operations.push({
-        protocolVersion: PROTOCOL_VERSION,
-        id: `${state.deviceId}-${sequence.toString(36)}-${crypto.randomUUID()}`,
-        deviceId: state.deviceId,
-        sequence,
-        createdAt: new Date().toISOString(),
-        changes: changes.slice(offset, offset + MAX_CHANGES_PER_OPERATION),
-      });
-    }
-    return operations;
+    return changes;
   }
 
   private async uploadOperation(operation: SyncOperation, files: Map<string, LocalFile>): Promise<void> {

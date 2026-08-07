@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { compactOperations, createInitialState, DestructiveSyncError, parseSyncState, SyncEngine, validateOperation } from "./engine.js";
+import { appendChanges, compactOperations, createInitialState, DestructiveSyncError, parseSyncState, SyncEngine, validateOperation } from "./engine.js";
 import { headsForPath, versionsByPath } from "./graph.js";
 import { sha256 } from "./hash.js";
-import { PROTOCOL_VERSION, type LocalFile, type LocalVault, type RemoteVault, type StateRepository, type SyncOperation, type SyncState } from "./types.js";
+import { PROTOCOL_VERSION, type LocalFile, type LocalVault, type Mutation, type RemoteVault, type StateRepository, type SyncOperation, type SyncState } from "./types.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -588,5 +588,61 @@ describe("compactOperations", () => {
     const b = device(phone, remote, "phone");
     await b.engine.sync();
     expect(phone.text("note.md")).toBe("body 6");
+  });
+});
+
+describe("appendChanges", () => {
+  const put = (path: string, parents: string[] = []): Mutation => ({
+    kind: "put",
+    path,
+    parents,
+    blobHash: "a".repeat(64),
+    size: 1,
+    mimeType: "text/markdown",
+  });
+
+  it("appends a pending operation minted from the state", () => {
+    const state = createInitialState("desktop");
+    const operation = appendChanges(state, [put("note.md")]);
+
+    expect(state.pending).toEqual([operation]);
+    expect(state.operations).toEqual({});
+    expect(operation.protocolVersion).toBe(PROTOCOL_VERSION);
+    expect(operation.deviceId).toBe("desktop");
+    expect(operation.sequence).toBe(1);
+    expect(Number.isFinite(Date.parse(operation.createdAt))).toBe(true);
+    expect(operation.changes).toEqual([put("note.md")]);
+  });
+
+  it("mints the operation id from the device and the next sequence", () => {
+    const state = createInitialState("desktop");
+    state.nextSequence = 42;
+    const operation = appendChanges(state, [put("note.md")]);
+
+    const prefix = `desktop-${(42).toString(36)}-`;
+    expect(operation.id.startsWith(prefix)).toBe(true);
+    expect(operation.id.slice(prefix.length).length).toBeGreaterThan(0);
+  });
+
+  it("mints and consumes one sequence number per call", () => {
+    const state = createInitialState("desktop");
+    const first = appendChanges(state, [put("a.md")]);
+    const second = appendChanges(state, [put("b.md")]);
+
+    expect(first.sequence).toBe(1);
+    expect(second.sequence).toBe(2);
+    expect(state.nextSequence).toBe(3);
+    expect(state.pending.map((operation) => operation.id)).toEqual([first.id, second.id]);
+  });
+
+  it("holds many changes in a single operation", () => {
+    const state = createInitialState("desktop");
+    const changes = Array.from({ length: 1_200 }, (_, index) => put(`notes/${index}.md`));
+
+    const operation = appendChanges(state, changes);
+
+    expect(state.pending).toHaveLength(1);
+    expect(operation.changes).toHaveLength(1_200);
+    expect(operation.changes.map((change) => change.path).at(-1)).toBe("notes/1199.md");
   });
 });
