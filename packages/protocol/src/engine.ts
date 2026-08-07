@@ -1,5 +1,5 @@
 import { assertNoCaseCollisions, conflictPath, normalizeVaultPath } from "./path.js";
-import { headsForVersions, versionsByPath, type VersionNode } from "./graph.js";
+import { headsForPath, headsForVersions, versionsByPath, type VersionNode } from "./graph.js";
 import { sha256 } from "./hash.js";
 import { PROTOCOL_VERSION, type Conflict, type LocalFile, type LocalVault, type Mutation, type RemoteVault, type StateRepository, type SyncEngineOptions, type SyncOperation, type SyncResult, type SyncState } from "./types.js";
 
@@ -207,11 +207,11 @@ export class SyncEngine {
       const prior = state.materialized[path];
       if (current?.hash === prior?.hash || (!current && !prior)) continue;
       if (!prior && current && bootstrapVersions) {
-        const alreadyRemote = headsForVersions(bootstrapVersions.get(path) ?? new Map())
+        const alreadyRemote = headsForPath(bootstrapVersions, path)
           .some((head) => head.mutation.kind === "put" && head.mutation.blobHash === current.hash);
         if (alreadyRemote) continue;
       }
-      const parents = headsForVersions(knownVersions.get(path) ?? new Map()).map((head) => head.operation.id);
+      const parents = headsForPath(knownVersions, path).map((head) => head.operation.id);
       if (current) {
         changes.push({
           kind: "put",

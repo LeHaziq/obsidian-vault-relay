@@ -1,4 +1,4 @@
-import { createInitialState, DestructiveSyncError, headsForVersions, PROTOCOL_VERSION, sha256, SyncEngine, versionsByPath, type StateRepository, type SyncOperation, type SyncState } from "@vault-relay/protocol";
+import { createInitialState, DestructiveSyncError, headsForPath, PROTOCOL_VERSION, sha256, SyncEngine, versionsByPath, type StateRepository, type SyncOperation, type SyncState } from "@vault-relay/protocol";
 import { Notice, Plugin, setIcon } from "obsidian";
 import { GoogleAuth } from "./auth";
 import { GoogleDriveRemote, type RemoteVaultSummary } from "./google-drive";
@@ -258,7 +258,7 @@ export default class VaultRelayPlugin extends Plugin {
       const files = new Map((await this.local.scan()).map((file) => [file.path, file] as const));
       const changes: SyncOperation["changes"] = [];
       for (const path of conflictPaths) {
-        const heads = headsForVersions(versions.get(path) ?? new Map()).map((head) => head.operation.id);
+        const heads = headsForPath(versions, path).map((head) => head.operation.id);
         if (heads.length < 2) throw new Error(`${path} no longer has concurrent versions`);
         const file = files.get(path);
         const keepFile = keepCurrent ?? file !== undefined;

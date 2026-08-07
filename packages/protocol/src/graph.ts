@@ -17,6 +17,15 @@ export function versionsByPath(operations: Record<string, SyncOperation>): Map<s
   return result;
 }
 
+/**
+ * Heads of one path. A path with no recorded versions has no heads, so callers
+ * never supply an empty-map fallback of their own.
+ */
+export function headsForPath(byPath: Map<string, Map<string, VersionNode>>, path: string): VersionNode[] {
+  const versions = byPath.get(path);
+  return versions ? headsForVersions(versions) : [];
+}
+
 export function headsForVersions(versions: Map<string, VersionNode>): VersionNode[] {
   assertAcyclic(versions);
   const parentIds = new Set<string>();
