@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { createInitialState, DestructiveSyncError, parseSyncState, SyncEngine, validateOperation } from "./engine.js";
+import { compactOperations, createInitialState, DestructiveSyncError, parseSyncState, SyncEngine, validateOperation } from "./engine.js";
+import { headsForPath, versionsByPath } from "./graph.js";
 import { sha256 } from "./hash.js";
 import { PROTOCOL_VERSION, type LocalFile, type LocalVault, type RemoteVault, type StateRepository, type SyncOperation, type SyncState } from "./types.js";
 
@@ -502,5 +503,90 @@ describe("parseSyncState", () => {
     const states = new MemoryState(parseSyncState("corrupt"));
     await new SyncEngine(local, remote, states).sync();
     expect(remote.operations.size).toBe(1);
+  });
+});
+
+/** One version of `path`, dated by day so the retention order is deterministic. */
+function version(id: string, path: string, parents: string[], day: number): SyncOperation {
+  return {
+    protocolVersion: PROTOCOL_VERSION,
+    id,
+    deviceId: "desktop",
+    sequence: day,
+    createdAt: `2026-02-${String(day).padStart(2, "0")}T00:00:00.000Z`,
+    changes: [{ kind: "put", path, parents, blobHash: "b".repeat(64), size: 1, mimeType: "text/markdown" }],
+  };
+}
+
+/** A linear history of `count` versions of one path, oldest first. */
+function chain(path: string, count: number): SyncOperation[] {
+  const operations: SyncOperation[] = [];
+  for (let index = 1; index <= count; index += 1) {
+    operations.push(version(`v${index}`, path, index === 1 ? [] : [`v${index - 1}`], index));
+  }
+  return operations;
+}
+
+function stateWith(operations: SyncOperation[], pending: SyncOperation[] = []): SyncState {
+  const state = createInitialState("desktop");
+  for (const operation of operations) state.operations[operation.id] = operation;
+  state.pending = pending;
+  return state;
+}
+
+describe("compactOperations", () => {
+  it("evicts versions beyond the retained count while keeping every head", () => {
+    const history = chain("note.md", 12);
+    // An edit made offline from an early version. It is a second head, and it is
+    // older than the retained window, so only the head rule can keep it.
+    const fork = version("fork", "note.md", ["v1"], 2);
+    const other = version("other", "other.md", [], 1);
+    const state = stateWith([...history, fork, other]);
+
+    compactOperations(state, 5);
+
+    expect(Object.keys(state.operations).sort()).toEqual(["fork", "other", "v10", "v11", "v12", "v8", "v9"]);
+    // Retention is per path, so a quiet path keeps its own single version.
+    expect(headsForPath(versionsByPath(state.operations), "other.md").map((head) => head.operation.id)).toEqual(["other"]);
+    expect(headsForPath(versionsByPath(state.operations), "note.md").map((head) => head.operation.id)).toEqual(["fork", "v12"]);
+  });
+
+  it("keeps a pending operation that the retained window would evict", () => {
+    // A pending operation can also be in the operation map, because a sync can
+    // pull back an operation this device has not yet marked as uploaded.
+    const history = chain("note.md", 12);
+    const pending = history[1]!;
+    const state = stateWith(history, [pending]);
+
+    compactOperations(state, 5);
+
+    expect(Object.keys(state.operations)).toContain("v2");
+    expect(Object.keys(state.operations)).not.toContain("v3");
+  });
+
+  it("keeps every version when retention is off", () => {
+    const state = stateWith(chain("note.md", 12));
+    compactOperations(state, 0);
+    expect(Object.keys(state.operations)).toHaveLength(12);
+  });
+
+  it("drops history from the state while the file stays correct", async () => {
+    const remote = new MemoryRemote();
+    const desktop = new MemoryLocal();
+    const states = new MemoryState(createInitialState("desktop"));
+    const engine = new SyncEngine(desktop, remote, states, { retainedVersionsPerPath: 2 });
+    for (let edit = 1; edit <= 6; edit += 1) {
+      desktop.set("note.md", `body ${edit}`);
+      await engine.sync();
+    }
+    expect(remote.operations.size).toBe(6);
+    expect(Object.keys(states.state.operations)).toHaveLength(2);
+
+    // The remote store keeps the full history. Thus a new device gets the same
+    // content.
+    const phone = new MemoryLocal();
+    const b = device(phone, remote, "phone");
+    await b.engine.sync();
+    expect(phone.text("note.md")).toBe("body 6");
   });
 });
