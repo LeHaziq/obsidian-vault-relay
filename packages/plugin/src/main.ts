@@ -1,9 +1,11 @@
 import { createInitialState, DestructiveSyncError, headsForPath, PROTOCOL_VERSION, sha256, SyncEngine, versionsByPath, type StateRepository, type SyncOperation, type SyncState } from "@vault-relay/protocol";
-import { Notice, Plugin, setIcon } from "obsidian";
+import { Plugin, setIcon } from "obsidian";
 import { GoogleAuth } from "./auth";
 import { GoogleDriveRemote, type RemoteVaultSummary } from "./google-drive";
 import { ObsidianLocalVault } from "./local-vault";
-import { DEFAULT_SETTINGS, sanitizeSettings, type DriveLayout, type PluginSettings } from "./model";
+import { DEFAULT_SETTINGS, type DriveLayout, type PluginSettings } from "./model";
+import { ObsidianNotifier, ObsidianSettingsStore } from "./obsidian-ports";
+import type { Notifier, SettingsStore } from "./ports";
 import { redactTokens } from "./redact";
 import { normalizeRelayOrigin } from "./relay-url";
 import { AuthorizationModal, ConflictModal, RestoreModal, SetupModal, VaultRelaySettingTab } from "./ui";
@@ -19,6 +21,11 @@ function isAbort(error: unknown): boolean {
 
 export default class VaultRelayPlugin extends Plugin {
   settings: PluginSettings = structuredClone(DEFAULT_SETTINGS);
+  // The plugin shell is the only place that knows these are the Obsidian ones.
+  // Everything else, here and in ui.ts, reaches persistence and the user
+  // through the ports rather than through the Obsidian plugin base class.
+  readonly notifier: Notifier = new ObsidianNotifier();
+  private readonly settingsStore: SettingsStore = new ObsidianSettingsStore(this);
   private auth!: GoogleAuth;
   private local!: ObsidianLocalVault;
   private statusEl!: HTMLElement;
@@ -32,7 +39,7 @@ export default class VaultRelayPlugin extends Plugin {
   private unloading = false;
 
   async onload(): Promise<void> {
-    await this.loadSettings();
+    this.settings = await this.settingsStore.load();
     this.auth = new GoogleAuth(this.app, () => this.settings.relayUrl);
     this.local = new ObsidianLocalVault(this.app.vault, () => this.settings.exclusions, () => this.settings.maxConcurrentRequests);
     this.settings.connected = this.auth.isConnected();
@@ -62,7 +69,7 @@ export default class VaultRelayPlugin extends Plugin {
         this.settings.paused = !this.settings.paused;
         await this.saveSettings();
         this.updateStatus();
-        new Notice(this.settings.paused ? "Vault Relay paused" : "Vault Relay resumed");
+        this.notifier.notice(this.settings.paused ? "Vault Relay paused" : "Vault Relay resumed");
       },
     });
 
@@ -123,7 +130,7 @@ export default class VaultRelayPlugin extends Plugin {
 
   async openSetup(): Promise<void> {
     if (!this.auth.isConnected()) {
-      new Notice("Connect Google Drive first");
+      this.notifier.notice("Connect Google Drive first");
       return;
     }
     try {
@@ -138,13 +145,13 @@ export default class VaultRelayPlugin extends Plugin {
     const created = await GoogleDriveRemote.create(this.auth, this.app.vault.getName());
     await this.rebind(created.layout);
     await this.syncNow(true);
-    new Notice("Remote vault created and initial upload completed");
+    this.notifier.notice("Remote vault created and initial upload completed");
   }
 
   async linkRemote(remote: RemoteVaultSummary): Promise<void> {
     await this.rebind(remote.layout);
     await this.syncNow(true);
-    new Notice(`Linked ${remote.name}`);
+    this.notifier.notice(`Linked ${remote.name}`);
   }
 
   /** Swapping the remote store resets sync state, so no sync may be in flight. */
@@ -171,11 +178,11 @@ export default class VaultRelayPlugin extends Plugin {
     if (this.inFlight) return this.inFlight;
     if (this.unloading) return Promise.resolve();
     if (this.settings.paused) {
-      if (showNotice) new Notice("Vault Relay is paused");
+      if (showNotice) this.notifier.notice("Vault Relay is paused");
       return Promise.resolve();
     }
     if (!this.settings.connected || !this.settings.layout) {
-      if (showNotice) new Notice("Set up Vault Relay first");
+      if (showNotice) this.notifier.notice("Set up Vault Relay first");
       return Promise.resolve();
     }
     this.syncing = true;
@@ -219,7 +226,7 @@ export default class VaultRelayPlugin extends Plugin {
       await this.saveSettings();
       if (showNotice) {
         const summary = `${result.uploadedOperations} uploaded, ${result.downloadedOperations} downloaded`;
-        new Notice(result.conflicts.length ? `${summary}; ${result.conflicts.length} conflict(s) preserved` : `Vault Relay synced: ${summary}`);
+        this.notifier.notice(result.conflicts.length ? `${summary}; ${result.conflicts.length} conflict(s) preserved` : `Vault Relay synced: ${summary}`);
       }
     } catch (error) {
       if (error instanceof DestructiveSyncError) this.settings.pendingLargeDeletionCount = error.count;
@@ -236,7 +243,7 @@ export default class VaultRelayPlugin extends Plugin {
       const remote = new GoogleDriveRemote(this.auth, layout, this.settings.maxConcurrentRequests);
       await this.local.write(path, await remote.getBlob(blobHash));
     });
-    new Notice(`Restored ${path}; sync to publish it as the current version`);
+    this.notifier.notice(`Restored ${path}; sync to publish it as the current version`);
   }
 
   async resolveConflict(path: string, keepCurrent: boolean): Promise<void> {
@@ -297,7 +304,7 @@ export default class VaultRelayPlugin extends Plugin {
       this.settings.allowLargeDeletesOnce = true;
       await this.saveSettings();
     });
-    new Notice(`Approved one sync that may trash ${count} files`);
+    this.notifier.notice(`Approved one sync that may trash ${count} files`);
     await this.syncNow(true);
   }
 
@@ -332,7 +339,7 @@ export default class VaultRelayPlugin extends Plugin {
   }
 
   async saveSettings(): Promise<void> {
-    await this.saveData(this.settings);
+    await this.settingsStore.save(this.settings);
   }
 
   /**
@@ -350,10 +357,6 @@ export default class VaultRelayPlugin extends Plugin {
       this.lock = null;
       release();
     }
-  }
-
-  private async loadSettings(): Promise<void> {
-    this.settings = sanitizeSettings(await this.loadData());
   }
 
   private createStatusBar(): void {
@@ -377,14 +380,14 @@ export default class VaultRelayPlugin extends Plugin {
 
   private async handleAuthCallback(ticket?: string, state?: string): Promise<void> {
     if (!ticket || !state) {
-      new Notice("Google sign-in returned an invalid response");
+      this.notifier.notice("Google sign-in returned an invalid response");
       return;
     }
     try {
       await this.auth.complete(ticket, state);
       this.settings.connected = true;
       await this.saveSettings();
-      new Notice("Google Drive connected");
+      this.notifier.notice("Google Drive connected");
       await this.openSetup();
     } catch (error) {
       await this.reportError(error);
@@ -402,7 +405,7 @@ export default class VaultRelayPlugin extends Plugin {
       } catch {
         // Reporting must not mask the original failure.
       }
-      new Notice(`Vault Relay: ${this.settings.lastError}`);
+      this.notifier.notice(`Vault Relay: ${this.settings.lastError}`);
       this.updateStatus();
     }
   }

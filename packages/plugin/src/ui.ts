@@ -1,4 +1,4 @@
-import { App, Modal, Notice, PluginSettingTab, Setting } from "obsidian";
+import { App, Modal, PluginSettingTab, Setting } from "obsidian";
 import type VaultRelayPlugin from "./main";
 import type { RemoteVaultSummary } from "./google-drive";
 import { MAX_CONCURRENCY, MIN_CONCURRENCY, SYNC_INTERVAL_CHOICES } from "./model";
@@ -97,7 +97,7 @@ export class VaultRelaySettingTab extends PluginSettingTab {
               this.display();
               return;
             }
-            if (result.error) new Notice(result.error);
+            if (result.error) this.plugin.notifier.notice(result.error);
             text.setValue(this.plugin.settings.relayUrl);
           } finally {
             committing = false;
@@ -218,7 +218,7 @@ export class SetupModal extends Modal {
           await this.plugin.createRemote();
           this.close();
         } catch (error) {
-          new Notice(error instanceof Error ? error.message : String(error));
+          this.plugin.notifier.notice(error instanceof Error ? error.message : String(error));
           button.setDisabled(false);
         }
       }));
@@ -239,7 +239,7 @@ export class SetupModal extends Modal {
             await this.plugin.linkRemote(remote);
             this.close();
           } catch (error) {
-            new Notice(error instanceof Error ? error.message : String(error));
+            this.plugin.notifier.notice(error instanceof Error ? error.message : String(error));
             button.setDisabled(false);
           }
         }));
@@ -269,7 +269,7 @@ export class ConflictModal extends Modal {
           await this.plugin.resolveAllConflicts();
           this.close();
         } catch (error) {
-          new Notice(error instanceof Error ? error.message : String(error));
+          this.plugin.notifier.notice(error instanceof Error ? error.message : String(error));
           button.setDisabled(false);
         }
       }));
@@ -286,7 +286,7 @@ export class ConflictModal extends Modal {
             await this.plugin.resolveConflict(conflict.path, true);
             this.close();
           } catch (error) {
-            new Notice(error instanceof Error ? error.message : String(error));
+            this.plugin.notifier.notice(error instanceof Error ? error.message : String(error));
             button.setDisabled(false);
           }
         }))
@@ -296,7 +296,7 @@ export class ConflictModal extends Modal {
             await this.plugin.resolveConflict(conflict.path, false);
             this.close();
           } catch (error) {
-            new Notice(error instanceof Error ? error.message : String(error));
+            this.plugin.notifier.notice(error instanceof Error ? error.message : String(error));
             button.setDisabled(false);
           }
         }));
@@ -331,7 +331,7 @@ export class RestoreModal extends Modal {
             await this.plugin.restoreVersion(change.path, change.blobHash);
             this.close();
           } catch (error) {
-            new Notice(error instanceof Error ? error.message : String(error));
+            this.plugin.notifier.notice(error instanceof Error ? error.message : String(error));
             button.setDisabled(false);
           }
         }));

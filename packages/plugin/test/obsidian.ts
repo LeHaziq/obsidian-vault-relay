@@ -23,6 +23,15 @@ export class TFolder extends TAbstractFile {
   children: TAbstractFile[] = [];
 }
 
+/** Every message a stub Notice was made with, in order. */
+export const shownNotices: string[] = [];
+
+export class Notice {
+  constructor(message: string | DocumentFragment) {
+    shownNotices.push(typeof message === "string" ? message : (message.textContent ?? ""));
+  }
+}
+
 export function requestUrl(): never {
   throw new Error("requestUrl is not available in tests");
 }
