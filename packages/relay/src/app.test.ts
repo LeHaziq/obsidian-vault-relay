@@ -1,11 +1,10 @@
-import { createServer } from "node:http";
-import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
-import { normalizeAddress, RelayApp } from "./app.js";
+import { normalizeAddress } from "./app.js";
 import type { Config } from "./config.js";
 import { clientChallenge } from "./pkce.test-helper.js";
-import { GrantStore } from "./store.js";
+import { createRelay } from "./relay.js";
+import type { GrantStore } from "./store.js";
 
 const KEY = "test-encryption-key-of-sufficient-length";
 const RETURN_TO = "obsidian://vault-relay-auth";
@@ -38,28 +37,18 @@ interface Harness {
 const running: Harness[] = [];
 
 async function start(tokenFetch: typeof fetch = jsonFetch({}), overrides: Partial<Config> = {}): Promise<Harness> {
-  const store = new GrantStore(new DatabaseSync(":memory:"), KEY);
   const calls: Array<Record<string, string>> = [];
   const recording: typeof fetch = async (input, init) => {
     calls.push(Object.fromEntries(new URLSearchParams(String(init?.body ?? ""))));
     return tokenFetch(input, init);
   };
-  const app = new RelayApp(baseConfig(overrides), store, recording);
-  const server = createServer((request, response) => {
-    app.handle(request, response).catch(() => response.destroy());
-  });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const address = server.address();
-  const port = typeof address === "object" && address !== null ? address.port : 0;
+  const relay = createRelay(baseConfig(overrides), { tokenFetch: recording });
+  const port = await relay.listen(0, "127.0.0.1");
   const harness: Harness = {
     base: `http://127.0.0.1:${port}`,
-    store,
+    store: relay.store,
     calls,
-    close: async () => {
-      app.dispose();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      store.close();
-    },
+    close: () => relay.close(),
   };
   running.push(harness);
   return harness;
