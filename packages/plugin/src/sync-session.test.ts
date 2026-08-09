@@ -2,7 +2,7 @@ import { createInitialState, sha256, type LocalFile, type LocalVault, type Remot
 import { describe, expect, it } from "vitest";
 import type { DriveLayout, PluginSettings } from "./model";
 import { InMemorySettingsStore, RecordingNotifier } from "./ports.test-helper";
-import { SyncSession, type Clock, type RemoteVaultFactory } from "./sync-session";
+import { SyncSession, type Clock, type RemoteVaultSession } from "./sync-session";
 
 const encoder = new TextEncoder();
 const layout: DriveLayout = { vaultId: "vault", rootId: "root", blobsId: "blobs", operationsId: "operations" };
@@ -59,10 +59,10 @@ class MemoryRemote implements RemoteVault {
   }
 }
 
-class MemoryRemoteFactory implements RemoteVaultFactory<object> {
-  creates = 0;
+class MemoryRemoteSession implements RemoteVaultSession {
+  opens = 0;
   constructor(readonly remote: RemoteVault) {}
-  create(): RemoteVault { this.creates += 1; return this.remote; }
+  open(): RemoteVault { this.opens += 1; return this.remote; }
 }
 
 const clock: Clock = { now: () => new Date("2026-08-09T01:02:03.000Z") };
@@ -81,7 +81,7 @@ async function subject(overrides: SubjectOverrides = {}) {
   const notifier = new RecordingNotifier();
   const local = new MemoryLocal();
   const remote = new MemoryRemote();
-  const remotes = new MemoryRemoteFactory(remote);
+  const remotes = new MemoryRemoteSession(remote);
   const session = new SyncSession({
     settings,
     settingsStore: store,
@@ -106,7 +106,7 @@ describe("SyncSession", () => {
     expect(second).toBe(first);
     release();
     await first;
-    expect(current.remotes.creates).toBe(1);
+    expect(current.remotes.opens).toBe(1);
     expect(current.remote.pulls).toBe(1);
     expect(current.session.getSettings().lastSyncAt).toBe("2026-08-09T01:02:03.000Z");
   });
@@ -119,7 +119,7 @@ describe("SyncSession", () => {
 
     await current.session.syncNow(true);
 
-    expect(current.remotes.creates).toBe(0);
+    expect(current.remotes.opens).toBe(0);
     expect(current.notifier.notices).toEqual([message]);
   });
 
@@ -166,6 +166,18 @@ describe("SyncSession", () => {
     expect(current.session.getSettings().syncState.nextSequence).toBe(1);
     expect(current.session.getSettings().syncState.deviceId).toBe("test-device");
     expect(current.session.getSettings().pendingLargeDeletionCount).toBe(0);
+  });
+
+  it("opens the configured remote vault through the shared session when restoring", async () => {
+    const current = await subject();
+    const content = encoder.encode("historical content");
+    current.remote.blobs.set("historical-hash", content.buffer);
+
+    await current.session.restoreVersion("restored.md", "historical-hash");
+
+    expect(current.remotes.opens).toBe(1);
+    expect(current.local.files.get("restored.md")).toEqual(content);
+    expect(current.notifier.notices).toEqual(["Restored restored.md; sync to publish it as the current version"]);
   });
 
   it("persists a redacted failure without clearing a blocked deletion count", async () => {

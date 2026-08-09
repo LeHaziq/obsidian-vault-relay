@@ -1,10 +1,10 @@
 import { Plugin, setIcon } from "obsidian";
 import { GoogleAuth } from "./auth";
-import { GoogleDriveRemote, type RemoteVaultSummary } from "./google-drive";
 import { ObsidianLocalVault } from "./local-vault";
 import { ObsidianNotifier, ObsidianSettingsStore } from "./obsidian-ports";
 import type { Notifier, SettingsStore } from "./ports";
 import { normalizeRelayOrigin } from "./relay-url";
+import { GoogleDriveSession, type RemoteVaultSummary } from "./remote-vault-session";
 import { SyncSession, type PreferenceChanges, type SettingsView } from "./sync-session";
 import { AuthorizationModal, ConflictModal, RestoreModal, SetupModal, VaultRelaySettingTab } from "./ui";
 
@@ -20,6 +20,7 @@ export default class VaultRelayPlugin extends Plugin {
   readonly notifier: Notifier = new ObsidianNotifier();
   private readonly settingsStore: SettingsStore = new ObsidianSettingsStore(this);
   private auth!: GoogleAuth;
+  private remoteVaults!: GoogleDriveSession;
   private local!: ObsidianLocalVault;
   private session!: SyncSession<GoogleAuth>;
   private statusEl!: HTMLElement;
@@ -34,13 +35,14 @@ export default class VaultRelayPlugin extends Plugin {
     const settings = await this.settingsStore.load();
     this.auth = new GoogleAuth(this.app, () => this.session.getSettings().relayUrl);
     this.local = new ObsidianLocalVault(this.app.vault, () => [...this.session.getSettings().exclusions], () => this.session.getSettings().maxConcurrentRequests);
+    this.remoteVaults = new GoogleDriveSession(this.auth, () => this.session.getSettings().maxConcurrentRequests);
     this.session = new SyncSession({
       settings,
       settingsStore: this.settingsStore,
       notifier: this.notifier,
       local: this.local,
       auth: this.auth,
-      remoteVaults: { create: (auth, layout, concurrency) => new GoogleDriveRemote(auth, layout, concurrency) },
+      remoteVaults: this.remoteVaults,
       clock: { now: () => new Date() },
     });
     this.session.onStatusChange(() => this.updateStatus());
@@ -130,7 +132,7 @@ export default class VaultRelayPlugin extends Plugin {
       return;
     }
     try {
-      const remotes = await GoogleDriveRemote.list(this.auth);
+      const remotes = await this.remoteVaults.list();
       new SetupModal(this.app, this, remotes).open();
     } catch (error) {
       await this.session.reportError(error);
@@ -138,7 +140,7 @@ export default class VaultRelayPlugin extends Plugin {
   }
 
   async createRemote(): Promise<void> {
-    const created = await GoogleDriveRemote.create(this.auth, this.app.vault.getName());
+    const created = await this.remoteVaults.create(this.app.vault.getName());
     await this.session.rebind(created.layout);
     await this.syncNow(true);
     this.notifier.notice("Remote vault created and initial upload completed");

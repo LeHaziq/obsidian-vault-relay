@@ -20,8 +20,8 @@ export interface Clock {
   now(): Date;
 }
 
-export interface RemoteVaultFactory<Auth> {
-  create(auth: Auth, layout: DriveLayout, maxConcurrentRequests: number): RemoteVault;
+export interface RemoteVaultSession {
+  open(layout: DriveLayout): RemoteVault;
 }
 
 export interface SessionAuth {
@@ -43,7 +43,7 @@ export interface SyncSessionDependencies<Auth> {
   notifier: Notifier;
   local: LocalVault;
   auth: Auth;
-  remoteVaults: RemoteVaultFactory<Auth>;
+  remoteVaults: RemoteVaultSession;
   clock: Clock;
 }
 
@@ -175,11 +175,7 @@ export class SyncSession<Auth extends SessionAuth> {
   }
 
   private remote(layout: DriveLayout): RemoteVault {
-    return this.dependencies.remoteVaults.create(
-      this.dependencies.auth,
-      layout,
-      this.mutableSettings.maxConcurrentRequests,
-    );
+    return this.dependencies.remoteVaults.open(layout);
   }
 
   private async runSync(showNotice: boolean): Promise<void> {

@@ -1,6 +1,5 @@
-import { mapLimit, PROTOCOL_VERSION, sha256, type RemoteVault, type SyncOperation, type VaultDescriptor } from "@vault-relay/protocol";
+import { mapLimit, sha256, type RemoteVault, type SyncOperation } from "@vault-relay/protocol";
 import { requestUrl, type RequestUrlParam, type RequestUrlResponse } from "obsidian";
-import type { GoogleAuth } from "./auth";
 import type { DriveLayout } from "./model";
 
 const API = "https://www.googleapis.com/drive/v3";
@@ -14,7 +13,7 @@ const MAX_ATTEMPTS = 5;
 /** 403 is only worth retrying when Drive attaches a throttling reason. */
 const RATE_LIMIT_REASONS = new Set(["rateLimitExceeded", "userRateLimitExceeded", "sharingRateLimitExceeded", "dailyLimitExceeded"]);
 
-interface DriveFile {
+export interface DriveFile {
   id: string;
   name: string;
   mimeType: string;
@@ -28,16 +27,16 @@ interface DriveList {
   nextPageToken?: string;
 }
 
-export interface RemoteVaultSummary {
-  name: string;
-  layout: DriveLayout;
-}
-
 export class DriveError extends Error {
   constructor(public readonly status: number, message: string) {
     super(message);
     this.name = "DriveError";
   }
+}
+
+export interface DriveAuth {
+  token(): Promise<string>;
+  invalidate(): void;
 }
 
 /**
@@ -47,7 +46,9 @@ export class DriveError extends Error {
  * latency calls (listing, vault creation) had no resilience at all.
  */
 export class DriveClient {
-  constructor(private readonly auth: GoogleAuth, readonly concurrency = 4) {}
+  constructor(private readonly auth: DriveAuth, private readonly currentConcurrency: () => number = () => 4) {}
+
+  get concurrency(): number { return this.currentConcurrency(); }
 
   async request(params: RequestUrlParam, acceptedStatuses: number[] = []): Promise<RequestUrlResponse> {
     const method = (params.method ?? "GET").toUpperCase();
@@ -172,61 +173,7 @@ export class DriveClient {
 }
 
 export class GoogleDriveRemote implements RemoteVault {
-  private readonly client: DriveClient;
-
-  constructor(auth: GoogleAuth, private readonly layout: DriveLayout, concurrency = 4) {
-    this.client = new DriveClient(auth, concurrency);
-  }
-
-  static async create(auth: GoogleAuth, name: string): Promise<RemoteVaultSummary> {
-    const client = new DriveClient(auth);
-    const vaultId = crypto.randomUUID();
-    const root = await client.createFolder(`Vault Relay - ${name}`, undefined, {
-      vaultRelayKind: "vault-root",
-      vaultId,
-      vaultName: name.slice(0, 100),
-      protocolVersion: String(PROTOCOL_VERSION),
-    });
-    const blobs = await client.createFolder("blobs", root.id, { vaultRelayKind: "blobs", vaultId });
-    const operations = await client.createFolder("operations", root.id, { vaultRelayKind: "operations", vaultId });
-    const descriptor: VaultDescriptor = {
-      protocolVersion: PROTOCOL_VERSION,
-      vaultId,
-      createdAt: new Date().toISOString(),
-      name: name.slice(0, 100),
-      encryption: null,
-    };
-    await client.uploadFile(
-      "vault.json",
-      root.id,
-      new TextEncoder().encode(JSON.stringify(descriptor, null, 2)).buffer as ArrayBuffer,
-      "application/json",
-      { vaultRelayKind: "descriptor", vaultId },
-    );
-    return { name, layout: { vaultId, rootId: root.id, blobsId: blobs.id, operationsId: operations.id } };
-  }
-
-  static async list(auth: GoogleAuth): Promise<RemoteVaultSummary[]> {
-    const client = new DriveClient(auth);
-    const roots = await client.listAll(`trashed = false and mimeType = '${FOLDER_MIME}' and appProperties has { key='vaultRelayKind' and value='vault-root' }`);
-    const summaries: RemoteVaultSummary[] = [];
-    for (const root of roots) {
-      const vaultId = root.appProperties?.vaultId;
-      if (!vaultId) continue;
-      const children = await client.listAll(`trashed = false and '${escapeQuery(root.id)}' in parents`);
-      const blobFolders = children.filter((file) => file.mimeType === FOLDER_MIME && file.appProperties?.vaultRelayKind === "blobs" && file.appProperties.vaultId === vaultId);
-      const operationFolders = children.filter((file) => file.mimeType === FOLDER_MIME && file.appProperties?.vaultRelayKind === "operations" && file.appProperties.vaultId === vaultId);
-      const descriptors = children.filter((file) => file.appProperties?.vaultRelayKind === "descriptor" && file.appProperties.vaultId === vaultId);
-      if (blobFolders.length !== 1 || operationFolders.length !== 1 || descriptors.length !== 1) continue;
-      const descriptor = await client.downloadJson<VaultDescriptor>(descriptors[0]!.id);
-      if (descriptor.protocolVersion !== PROTOCOL_VERSION || descriptor.vaultId !== vaultId || descriptor.name !== (root.appProperties?.vaultName ?? descriptor.name)) continue;
-      summaries.push({
-        name: root.appProperties?.vaultName ?? root.name.replace(/^Vault Relay - /, ""),
-        layout: { vaultId, rootId: root.id, blobsId: blobFolders[0]!.id, operationsId: operationFolders[0]!.id },
-      });
-    }
-    return summaries;
-  }
+  constructor(private readonly client: DriveClient, private readonly layout: DriveLayout) {}
 
   async pullOperations(cursor: string | null): Promise<{ operations: SyncOperation[]; cursor: string }> {
     if (!cursor) {

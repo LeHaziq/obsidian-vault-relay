@@ -1,7 +1,7 @@
 import { App, Modal, PluginSettingTab, Setting } from "obsidian";
 import type VaultRelayPlugin from "./main";
-import type { RemoteVaultSummary } from "./google-drive";
 import { MAX_CONCURRENCY, MIN_CONCURRENCY, SYNC_INTERVAL_CHOICES } from "./model";
+import type { RemoteVaultSummary } from "./remote-vault-session";
 
 export class ConfirmModal extends Modal {
   private decided = false;
