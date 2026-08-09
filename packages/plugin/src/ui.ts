@@ -70,6 +70,7 @@ export class VaultRelaySettingTab extends PluginSettingTab {
 
   display(): void {
     const { containerEl } = this;
+    const settings = this.plugin.getSettings();
     containerEl.empty();
     containerEl.createEl("h2", { text: "Vault Relay" });
 
@@ -77,14 +78,14 @@ export class VaultRelaySettingTab extends PluginSettingTab {
       .setName("OAuth relay URL")
       .setDesc("HTTPS address of your deployed Vault Relay authentication service. Applied when you leave the field or press Enter.")
       .addText((text) => {
-        text.setPlaceholder("https://auth.example.com").setValue(this.plugin.settings.relayUrl);
+        text.setPlaceholder("https://auth.example.com").setValue(settings.relayUrl);
         let committing = false;
         const commit = async (): Promise<void> => {
           // Committing per keystroke tore down the Google credential partway
           // through typing, because prefixes such as "https://a" are valid.
           if (committing) return;
           const value = text.inputEl.value.trim();
-          if (!value || value === this.plugin.settings.relayUrl) return;
+          if (!value || value === settings.relayUrl) return;
           committing = true;
           try {
             const result = await this.plugin.updateRelayUrl(value, () => confirmAction(
@@ -98,7 +99,7 @@ export class VaultRelaySettingTab extends PluginSettingTab {
               return;
             }
             if (result.error) this.plugin.notifier.notice(result.error);
-            text.setValue(this.plugin.settings.relayUrl);
+            text.setValue(settings.relayUrl);
           } finally {
             committing = false;
           }
@@ -113,19 +114,19 @@ export class VaultRelaySettingTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
-      .setName(this.plugin.settings.connected ? "Google Drive connected" : "Connect Google Drive")
-      .setDesc(this.plugin.settings.connected ? "Tokens are stored in Obsidian SecretStorage." : "Sign in through the configured OAuth relay.")
+      .setName(settings.connected ? "Google Drive connected" : "Connect Google Drive")
+      .setDesc(settings.connected ? "Tokens are stored in Obsidian SecretStorage." : "Sign in through the configured OAuth relay.")
       .addButton((button) => button
-        .setButtonText(this.plugin.settings.connected ? "Reconnect" : "Connect")
+        .setButtonText(settings.connected ? "Reconnect" : "Connect")
         .setCta()
         .onClick(() => void this.plugin.connect()));
 
-    if (this.plugin.settings.connected) {
+    if (settings.connected) {
       new Setting(containerEl)
         .setName("Remote vault")
-        .setDesc(this.plugin.settings.layout ? `Connected to ${this.plugin.settings.layout.vaultId}` : "Choose whether this device creates or links a remote vault.")
+        .setDesc(settings.layout ? `Connected to ${settings.layout.vaultId}` : "Choose whether this device creates or links a remote vault.")
         .addButton((button) => button
-          .setButtonText(this.plugin.settings.layout ? "Change" : "Choose")
+          .setButtonText(settings.layout ? "Change" : "Choose")
           .onClick(() => void this.plugin.openSetup()));
     }
 
@@ -137,12 +138,11 @@ export class VaultRelaySettingTab extends PluginSettingTab {
           String(minutes),
           minutes === 1 ? "Every minute" : `Every ${minutes} minutes`,
         ])))
-        .setValue(String(this.plugin.settings.autoSyncMinutes))
+        .setValue(String(settings.autoSyncMinutes))
         .onChange(async (value) => {
           const minutes = Number(value);
           if (!Number.isFinite(minutes) || minutes < 1) return;
-          this.plugin.settings.autoSyncMinutes = minutes;
-          await this.plugin.saveSettings();
+          await this.plugin.updatePreferences({ autoSyncMinutes: minutes });
           this.plugin.resetTimer();
         }));
 
@@ -151,21 +151,19 @@ export class VaultRelaySettingTab extends PluginSettingTab {
       .setDesc(`How many Google Drive transfers run at once (${MIN_CONCURRENCY}-${MAX_CONCURRENCY}). Lower this on a slow or metered connection.`)
       .addSlider((slider) => slider
         .setLimits(MIN_CONCURRENCY, MAX_CONCURRENCY, 1)
-        .setValue(this.plugin.settings.maxConcurrentRequests)
+        .setValue(settings.maxConcurrentRequests)
         .setDynamicTooltip()
         .onChange(async (value) => {
-          this.plugin.settings.maxConcurrentRequests = value;
-          await this.plugin.saveSettings();
+          await this.plugin.updatePreferences({ maxConcurrentRequests: value });
         }));
 
     new Setting(containerEl)
       .setName("Pause synchronization")
       .setDesc("Local changes remain in the vault and will be captured when syncing resumes.")
       .addToggle((toggle) => toggle
-        .setValue(this.plugin.settings.paused)
+        .setValue(settings.paused)
         .onChange(async (value) => {
-          this.plugin.settings.paused = value;
-          await this.plugin.saveSettings();
+          await this.plugin.updatePreferences({ paused: value });
           this.plugin.updateStatus();
         }));
 
@@ -173,22 +171,21 @@ export class VaultRelaySettingTab extends PluginSettingTab {
       .setName("Excluded paths")
       .setDesc("One rule per line. A trailing slash excludes a folder, a name without a slash excludes that file name at any depth, and anything else is an exact path. The .obsidian folder is always excluded.")
       .addTextArea((text) => text
-        .setValue(this.plugin.settings.exclusions.join("\n"))
+        .setValue(settings.exclusions.join("\n"))
         .onChange(async (value) => {
-          this.plugin.settings.exclusions = value.split("\n").map((entry) => entry.trim()).filter(Boolean);
-          await this.plugin.saveSettings();
+          await this.plugin.updatePreferences({ exclusions: value.split("\n").map((entry) => entry.trim()).filter(Boolean) });
         }));
 
-    if (this.plugin.settings.lastSyncAt) {
-      containerEl.createEl("p", { cls: "vault-relay-setting-note", text: `Last successful sync: ${new Date(this.plugin.settings.lastSyncAt).toLocaleString()}` });
+    if (settings.lastSyncAt) {
+      containerEl.createEl("p", { cls: "vault-relay-setting-note", text: `Last successful sync: ${new Date(settings.lastSyncAt).toLocaleString()}` });
     }
-    if (this.plugin.settings.lastError) {
-      containerEl.createEl("p", { cls: "vault-relay-setting-note", text: `Last error: ${this.plugin.settings.lastError}` });
+    if (settings.lastError) {
+      containerEl.createEl("p", { cls: "vault-relay-setting-note", text: `Last error: ${settings.lastError}` });
     }
-    if (this.plugin.settings.pendingLargeDeletionCount > 0) {
+    if (settings.pendingLargeDeletionCount > 0) {
       new Setting(containerEl)
         .setName("Bulk deletion blocked")
-        .setDesc(`Vault Relay stopped before trashing ${this.plugin.settings.pendingLargeDeletionCount} files. Review the other device before approving.`)
+        .setDesc(`Vault Relay stopped before trashing ${settings.pendingLargeDeletionCount} files. Review the other device before approving.`)
         .addButton((button) => button.setButtonText("Approve once").setWarning().onClick(() => void this.plugin.approveLargeDeletion()));
     }
   }
@@ -254,7 +251,8 @@ export class ConflictModal extends Modal {
 
   onOpen(): void {
     this.setTitle("Vault Relay conflicts");
-    const conflicts = this.plugin.settings.conflicts;
+    const settings = this.plugin.getSettings();
+    const conflicts = settings.conflicts;
     if (conflicts.length === 0) {
       this.contentEl.createEl("p", { text: "No unresolved concurrent versions were found during the last sync." });
       return;
@@ -311,7 +309,8 @@ export class RestoreModal extends Modal {
 
   onOpen(): void {
     this.setTitle("Restore a historical version");
-    const versions = Object.values(this.plugin.settings.syncState.operations)
+    const settings = this.plugin.getSettings();
+    const versions = Object.values(settings.syncState.operations)
       .flatMap((operation) => operation.changes
         .filter((change) => change.kind === "put")
         .map((change) => ({ operation, change })))
