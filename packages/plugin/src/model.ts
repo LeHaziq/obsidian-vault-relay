@@ -1,5 +1,7 @@
-import { createInitialState, parseSyncState, type Conflict, type SyncState } from "@vault-relay/protocol";
 import { safeRelayOrigin } from "./relay-url";
+
+/** A persisted value that only Protocol is allowed to interpret. */
+export type OpaqueProtocolState = unknown;
 
 export interface DriveLayout {
   vaultId: string;
@@ -16,10 +18,10 @@ export interface PluginSettings {
   maxConcurrentRequests: number;
   exclusions: string[];
   layout: DriveLayout | null;
-  syncState: SyncState;
+  /** Opaque persisted Protocol state. The plugin never inspects it. */
+  syncState: OpaqueProtocolState;
   lastSyncAt: string | null;
   lastError: string | null;
-  conflicts: Conflict[];
   allowLargeDeletesOnce: boolean;
   pendingLargeDeletionCount: number;
 }
@@ -36,10 +38,9 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   maxConcurrentRequests: 4,
   exclusions: [".obsidian/", ".trash/", ".DS_Store", "Thumbs.db"],
   layout: null,
-  syncState: createInitialState(),
+  syncState: undefined,
   lastSyncAt: null,
   lastError: null,
-  conflicts: [],
   allowLargeDeletesOnce: false,
   pendingLargeDeletionCount: 0,
 };
@@ -69,16 +70,6 @@ function layout(value: unknown): DriveLayout | null {
   return { vaultId: value.vaultId as string, rootId: value.rootId as string, blobsId: value.blobsId as string, operationsId: value.operationsId as string };
 }
 
-function conflicts(value: unknown): Conflict[] {
-  if (!Array.isArray(value)) return [];
-  return value.flatMap((entry) => {
-    if (!isRecord(entry) || typeof entry.path !== "string") return [];
-    const heads = Array.isArray(entry.heads) ? entry.heads.filter((head): head is string => typeof head === "string") : [];
-    const conflictPaths = Array.isArray(entry.conflictPaths) ? entry.conflictPaths.filter((path): path is string => typeof path === "string") : [];
-    return [{ path: entry.path, heads, conflictPaths }];
-  });
-}
-
 export function sanitizeSettings(loaded: unknown): PluginSettings {
   const source = isRecord(loaded) ? loaded : {};
   const relayUrl = typeof source.relayUrl === "string" ? safeRelayOrigin(source.relayUrl) : null;
@@ -96,12 +87,10 @@ export function sanitizeSettings(loaded: unknown): PluginSettings {
     maxConcurrentRequests: integer(source.maxConcurrentRequests, DEFAULT_SETTINGS.maxConcurrentRequests, MIN_CONCURRENCY, MAX_CONCURRENCY),
     exclusions,
     layout: resolvedLayout,
-    // The protocol gives the rule for a valid sync state. All persisted data is
-    // untrusted. A state that the protocol rejects becomes an initial state.
-    syncState: parseSyncState(source.syncState),
+    // Protocol parses and initializes this persisted value when it runs.
+    syncState: source.syncState,
     lastSyncAt: text(source.lastSyncAt, null, 64),
     lastError: text(source.lastError, null),
-    conflicts: conflicts(source.conflicts),
     allowLargeDeletesOnce: boolean(source.allowLargeDeletesOnce, false),
     pendingLargeDeletionCount: integer(source.pendingLargeDeletionCount, 0, 0, Number.MAX_SAFE_INTEGER),
   };

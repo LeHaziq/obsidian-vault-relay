@@ -80,7 +80,7 @@ class MemoryRemote implements RemoteVault {
 class MemoryState implements StateRepository {
   constructor(public state: SyncState) {}
   async load(): Promise<SyncState> { return structuredClone(this.state); }
-  async save(state: SyncState): Promise<void> { this.state = structuredClone(state); }
+  async save(state: unknown): Promise<void> { this.state = structuredClone(state) as SyncState; }
 }
 
 function device(local: MemoryLocal, remote: MemoryRemote, id: string) {

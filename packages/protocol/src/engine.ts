@@ -3,7 +3,10 @@ import { headsForPath, headsForVersions, versionsByPath, type VersionNode } from
 import { sha256 } from "./hash.js";
 import { PROTOCOL_VERSION, type Conflict, type LocalFile, type LocalVault, type MaterializedFile, type Mutation, type RemoteVault, type StateRepository, type SyncEngineOptions, type SyncOperation, type SyncResult, type SyncState } from "./types.js";
 
-export const MAX_CHANGES_PER_OPERATION = 1_000;
+/** Local filesystem capture is chunked to keep ordinary sync work bounded. */
+export const MAX_CAPTURE_CHANGES_PER_OPERATION = 1_000;
+/** A valid wire operation and Version History resolution can carry this many paths. */
+export const MAX_CHANGES_PER_OPERATION = 10_000;
 const DEFAULT_REPAIR_INTERVAL_MS = 6 * 60 * 60_000;
 const DEFAULT_CHECKPOINT_FILES = 50;
 const DEFAULT_CHECKPOINT_MS = 2_000;
@@ -37,7 +40,7 @@ export function validateOperation(value: unknown): SyncOperation {
   if (typeof value.deviceId !== "string" || value.deviceId.length > MAX_DEVICE_ID_LENGTH || typeof value.sequence !== "number" || !Number.isSafeInteger(value.sequence) || value.sequence < 1) {
     throw new Error(`Remote operation has invalid device metadata: ${id}`);
   }
-  if (typeof value.createdAt !== "string" || !Number.isFinite(Date.parse(value.createdAt)) || !Array.isArray(value.changes) || value.changes.length > 10_000) {
+  if (typeof value.createdAt !== "string" || !Number.isFinite(Date.parse(value.createdAt)) || !Array.isArray(value.changes) || value.changes.length > MAX_CHANGES_PER_OPERATION) {
     throw new Error(`Remote operation has invalid change metadata: ${id}`);
   }
   const changes: unknown[] = value.changes;
@@ -242,7 +245,7 @@ export class SyncEngine {
 
   private async run(): Promise<SyncResult> {
     this.checkAborted();
-    const state = await this.states.load();
+    const state = parseSyncState(await this.states.load());
     for (const operation of Object.values(state.operations)) validateOperation(operation);
     for (const operation of state.pending) validateOperation(operation);
     const bootstrapping = state.cursor === null
@@ -270,8 +273,8 @@ export class SyncEngine {
     const remoteVersions = bootstrapping ? versionsByPath(state.operations) : null;
     const pending = await this.captureLocalChanges(state, localByPath, pendingPaths, knownVersions, remoteVersions);
     if (pending.length > 0) {
-      for (let offset = 0; offset < pending.length; offset += MAX_CHANGES_PER_OPERATION) {
-        appendChanges(state, pending.slice(offset, offset + MAX_CHANGES_PER_OPERATION));
+      for (let offset = 0; offset < pending.length; offset += MAX_CAPTURE_CHANGES_PER_OPERATION) {
+        appendChanges(state, pending.slice(offset, offset + MAX_CAPTURE_CHANGES_PER_OPERATION));
       }
       await this.states.save(state);
     }

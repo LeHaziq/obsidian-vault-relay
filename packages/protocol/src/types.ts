@@ -79,8 +79,9 @@ export interface RemoteVault {
 }
 
 export interface StateRepository {
-  load(): Promise<SyncState>;
-  save(state: SyncState): Promise<void>;
+  /** Protocol state is intentionally opaque to adapters and callers. */
+  load(): Promise<unknown>;
+  save(state: unknown): Promise<void>;
 }
 
 export interface Conflict {

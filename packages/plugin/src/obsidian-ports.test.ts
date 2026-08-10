@@ -25,11 +25,10 @@ describe("ObsidianSettingsStore", () => {
     expect(settings.paused).toBe(true);
   });
 
-  it("gives the default settings, with a fresh device, when nothing is stored yet", async () => {
+  it("gives the default settings when nothing is stored yet", async () => {
     const store = new ObsidianSettingsStore(new FakePluginData(null));
     const settings = await store.load();
-    expect(settings.syncState.deviceId).not.toBe(DEFAULT_SETTINGS.syncState.deviceId);
-    expect({ ...settings, syncState: DEFAULT_SETTINGS.syncState }).toEqual(DEFAULT_SETTINGS);
+    expect(settings).toEqual(DEFAULT_SETTINGS);
   });
 
   it("writes the settings through to the plugin data", async () => {

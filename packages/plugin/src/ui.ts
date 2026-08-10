@@ -1,4 +1,5 @@
 import { App, Modal, PluginSettingTab, Setting } from "obsidian";
+import type { VersionHistorySnapshot } from "@vault-relay/protocol";
 import type VaultRelayPlugin from "./main";
 import { MAX_CONCURRENCY, MIN_CONCURRENCY, SYNC_INTERVAL_CHOICES } from "./model";
 import type { RemoteVaultSummary } from "./remote-vault-session";
@@ -36,6 +37,16 @@ export class ConfirmModal extends Modal {
 
 function confirmAction(app: App, title: string, body: string, confirmText: string): Promise<boolean> {
   return new Promise((resolve) => new ConfirmModal(app, title, body, confirmText, resolve).open());
+}
+
+async function loadVersionHistory(plugin: VaultRelayPlugin, content: HTMLElement, unavailable: string): Promise<VersionHistorySnapshot | null> {
+  try {
+    return await plugin.versionHistorySnapshot();
+  } catch (error) {
+    content.createEl("p", { text: unavailable });
+    plugin.notifier.notice(error instanceof Error ? error.message : String(error));
+    return null;
+  }
 }
 
 export class AuthorizationModal extends Modal {
@@ -251,10 +262,16 @@ export class ConflictModal extends Modal {
 
   onOpen(): void {
     this.setTitle("Vault Relay conflicts");
-    const settings = this.plugin.getSettings();
-    const conflicts = settings.conflicts;
+    void this.render();
+  }
+
+  private async render(): Promise<void> {
+    this.contentEl.empty();
+    const snapshot = await loadVersionHistory(this.plugin, this.contentEl, "Conflicts are unavailable until Vault Relay can read retained Version History.");
+    if (!snapshot) return;
+    const { conflicts } = snapshot;
     if (conflicts.length === 0) {
-      this.contentEl.createEl("p", { text: "No unresolved concurrent versions were found during the last sync." });
+      this.contentEl.createEl("p", { text: "No unresolved concurrent versions were found in retained Version History." });
       return;
     }
     this.contentEl.createEl("p", { text: "Vault Relay preserved concurrent content as conflict copies. Compare the files, keep the content you want, and delete the extra copy." });
@@ -264,7 +281,7 @@ export class ConflictModal extends Modal {
       .addButton((button) => button.setButtonText("Keep current state for all").setCta().onClick(async () => {
         button.setDisabled(true);
         try {
-          await this.plugin.resolveAllConflicts();
+          await this.plugin.resolveConflicts(conflicts.map((conflict) => ({ reference: conflict.reference, choice: conflict.current === "file" ? "keep-current-file" : "keep-deleted" })));
           this.close();
         } catch (error) {
           this.plugin.notifier.notice(error instanceof Error ? error.message : String(error));
@@ -281,7 +298,7 @@ export class ConflictModal extends Modal {
         .addButton((button) => button.setButtonText("Keep current file").setCta().onClick(async () => {
           button.setDisabled(true);
           try {
-            await this.plugin.resolveConflict(conflict.path, true);
+            await this.plugin.resolveConflicts([{ reference: conflict.reference, choice: "keep-current-file" }]);
             this.close();
           } catch (error) {
             this.plugin.notifier.notice(error instanceof Error ? error.message : String(error));
@@ -291,7 +308,7 @@ export class ConflictModal extends Modal {
         .addButton((button) => button.setButtonText("Keep deleted").setWarning().onClick(async () => {
           button.setDisabled(true);
           try {
-            await this.plugin.resolveConflict(conflict.path, false);
+            await this.plugin.resolveConflicts([{ reference: conflict.reference, choice: "keep-deleted" }]);
             this.close();
           } catch (error) {
             this.plugin.notifier.notice(error instanceof Error ? error.message : String(error));
@@ -309,25 +326,28 @@ export class RestoreModal extends Modal {
 
   onOpen(): void {
     this.setTitle("Restore a historical version");
-    const settings = this.plugin.getSettings();
-    const versions = Object.values(settings.syncState.operations)
-      .flatMap((operation) => operation.changes
-        .filter((change) => change.kind === "put")
-        .map((change) => ({ operation, change })))
-      .sort((left, right) => right.operation.createdAt.localeCompare(left.operation.createdAt));
+    void this.render();
+  }
+
+  private async render(): Promise<void> {
+    this.contentEl.empty();
+    const snapshot = await loadVersionHistory(this.plugin, this.contentEl, "Version History is unavailable until Vault Relay can read retained versions.");
+    if (!snapshot) return;
+    const { historicalVersions: versions } = snapshot;
     if (versions.length === 0) {
-      this.contentEl.createEl("p", { text: "No uploaded file versions are available on this device yet." });
+      this.contentEl.createEl("p", { text: "No retained versions are available on this device yet." });
       return;
     }
-    this.contentEl.createEl("p", { text: "Restoring writes the selected content locally. The next sync records it as a new version; history is not deleted." });
-    for (const { operation, change } of versions.slice(0, 200)) {
-      new Setting(this.contentEl)
-        .setName(change.path)
-        .setDesc(`${new Date(operation.createdAt).toLocaleString()} · ${operation.deviceId}`)
-        .addButton((button) => button.setButtonText("Restore").onClick(async () => {
+    this.contentEl.createEl("p", { text: "Restoring records the selected content as a new pending version. The next sync publishes it; history is not deleted." });
+    for (const version of versions.slice(0, 200)) {
+      const setting = new Setting(this.contentEl)
+        .setName(version.path)
+        .setDesc(`${new Date(version.createdAt).toLocaleString()}${version.deviceId ? ` · ${version.deviceId}` : ""}${version.content === "deletion" ? version.publication === "published" ? " · Deleted" : " · Deletion pending publication" : version.publication === "pending" ? " · Pending publication" : ""}`);
+      if (!version.restorable) continue;
+      setting.addButton((button) => button.setButtonText("Restore").onClick(async () => {
           button.setDisabled(true);
           try {
-            await this.plugin.restoreVersion(change.path, change.blobHash);
+            await this.plugin.restoreVersion(version.reference);
             this.close();
           } catch (error) {
             this.plugin.notifier.notice(error instanceof Error ? error.message : String(error));

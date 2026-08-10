@@ -1,4 +1,5 @@
 import { Plugin, setIcon } from "obsidian";
+import type { ConflictChoice, HistoricalVersionReference, VersionHistorySnapshot } from "@vault-relay/protocol";
 import { GoogleAuth } from "./auth";
 import { ObsidianLocalVault } from "./local-vault";
 import { ObsidianNotifier, ObsidianSettingsStore } from "./obsidian-ports";
@@ -51,6 +52,7 @@ export default class VaultRelayPlugin extends Plugin {
     const ribbon = this.addRibbonIcon("refresh-cw", "Sync with Vault Relay", () => void this.syncNow(true));
     ribbon.setAttribute("aria-label", "Sync with Vault Relay");
     this.createStatusBar();
+    await this.session.initializeStatus();
     this.addSettingTab(new VaultRelaySettingTab(this.app, this));
 
     this.addCommand({ id: "sync-now", name: "Sync now", callback: () => void this.syncNow(true) });
@@ -158,16 +160,16 @@ export default class VaultRelayPlugin extends Plugin {
     return sync;
   }
 
-  async restoreVersion(path: string, blobHash: string): Promise<void> {
-    await this.session.restoreVersion(path, blobHash);
+  versionHistorySnapshot(): Promise<VersionHistorySnapshot> {
+    return this.session.versionHistorySnapshot();
   }
 
-  async resolveConflict(path: string, keepCurrent: boolean): Promise<void> {
-    await this.session.resolveConflict(path, keepCurrent);
+  async restoreVersion(reference: HistoricalVersionReference): Promise<void> {
+    await this.session.restoreVersion(reference);
   }
 
-  async resolveAllConflicts(): Promise<void> {
-    await this.session.resolveAllConflicts();
+  async resolveConflicts(choices: readonly ConflictChoice[]): Promise<void> {
+    await this.session.resolveConflicts(choices);
   }
 
   async approveLargeDeletion(): Promise<void> {
@@ -196,9 +198,9 @@ export default class VaultRelayPlugin extends Plugin {
     } else if (this.session.getSettings().lastError) {
       this.statusDot.addClass("is-error");
       this.statusText.setText("Vault Relay: error");
-    } else if (this.session.getSettings().conflicts.length) {
+    } else if (this.session.hasConflicts) {
       this.statusDot.addClass("is-conflict");
-      this.statusText.setText(`Vault Relay: ${this.session.getSettings().conflicts.length} conflict(s)`);
+      this.statusText.setText("Vault Relay: conflicts need attention");
     } else if (this.session.getSettings().paused) {
       this.statusText.setText("Vault Relay: paused");
     } else if (!this.session.getSettings().layout) {

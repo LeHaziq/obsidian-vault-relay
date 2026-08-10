@@ -19,9 +19,14 @@ describe("InMemorySettingsStore", () => {
     expect(store.saves).toBe(1);
   });
 
-  it("keeps the device across loads, as a reload does", async () => {
-    const store = new InMemorySettingsStore();
-    expect((await store.load()).syncState.deviceId).toBe((await store.load()).syncState.deviceId);
+  it("preserves opaque protocol state across loads", async () => {
+    const state = "opaque persisted protocol state";
+    const store = new InMemorySettingsStore({ syncState: state });
+    const first = await store.load();
+    const second = await store.load();
+    expect(first.syncState).toBe(state);
+    expect(second.syncState).toBe(state);
+    expect(first).not.toBe(second);
   });
 
   it("copies on load and on save, so a caller cannot mutate the stored settings", async () => {

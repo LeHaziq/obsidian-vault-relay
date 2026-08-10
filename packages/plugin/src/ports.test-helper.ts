@@ -5,6 +5,9 @@ import type { Notifier, SettingsStore } from "./ports";
 export class InMemorySettingsStore implements SettingsStore {
   /** How many times the settings were written, to catch a missing save. */
   saves = 0;
+  failNextSave: Error | null = null;
+  saveGate: Promise<void> = Promise.resolve();
+  readonly saved: PluginSettings[] = [];
   private stored: unknown;
 
   constructor(overrides: Partial<PluginSettings> = {}) {
@@ -19,7 +22,14 @@ export class InMemorySettingsStore implements SettingsStore {
     // Obsidian writes JSON, so keep the same round trip: a later mutation of
     // the caller's object must not reach the stored settings, and settings that
     // do not survive JSON must fail here too.
+    await this.saveGate;
+    if (this.failNextSave) {
+      const failure = this.failNextSave;
+      this.failNextSave = null;
+      throw failure;
+    }
     this.stored = JSON.parse(JSON.stringify(settings));
+    this.saved.push(sanitizeSettings(this.stored));
     this.saves += 1;
   }
 

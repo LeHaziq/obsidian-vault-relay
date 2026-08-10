@@ -1,4 +1,3 @@
-import { parseSyncState, PROTOCOL_VERSION } from "@vault-relay/protocol";
 import { describe, expect, it } from "vitest";
 import { DEFAULT_SETTINGS, MAX_CONCURRENCY, sanitizeSettings } from "./model";
 
@@ -41,26 +40,15 @@ describe("sanitizeSettings", () => {
     expect(sanitizeSettings({ layout: complete }).layout).toEqual(complete);
   });
 
-  it("delegates sync-state parsing to the protocol", () => {
-    // The protocol owns the shape rules; this only proves the settings reach it.
-    const corrupt = sanitizeSettings({ syncState: { protocolVersion: PROTOCOL_VERSION, deviceId: "phone-1", operations: "nope" } }).syncState;
-    expect(corrupt.deviceId).toBe("phone-1");
-    expect(corrupt.operations).toEqual({});
-    // The device identity is a new random id each time, thus compare the rest.
-    const { deviceId, ...absent } = sanitizeSettings({}).syncState;
-    const { deviceId: fresh, ...initial } = parseSyncState(undefined);
-    expect(absent).toEqual(initial);
-    expect(deviceId).not.toBe(fresh);
+  it("retains every protocol-state value opaquely for Protocol to parse", () => {
+    for (const persisted of [{ protocolVersion: 1, deviceId: "phone-1", operations: "nope" }, "corrupt", 42, null]) {
+      expect(sanitizeSettings({ syncState: persisted }).syncState).toEqual(persisted);
+    }
   });
 
   it("filters exclusion entries and trims whitespace", () => {
     const settings = sanitizeSettings({ exclusions: ["  a/  ", "", "   ", 5, null, "b.md"] });
     expect(settings.exclusions).toEqual(["a/", "b.md"]);
-  });
-
-  it("drops malformed conflict entries", () => {
-    const settings = sanitizeSettings({ conflicts: [{ path: "a.md", heads: ["x", 2], conflictPaths: null }, { heads: [] }, "junk"] });
-    expect(settings.conflicts).toEqual([{ path: "a.md", heads: ["x"], conflictPaths: [] }]);
   });
 
   it("never carries a negative pending deletion count", () => {
